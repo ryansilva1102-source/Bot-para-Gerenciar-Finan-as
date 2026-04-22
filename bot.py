@@ -953,19 +953,25 @@ def responder(message):
         bot.send_chat_action(message.chat.id, "typing")
 
         # Linha 953: Chama a IA normalmente
+       # Chama a IA
         resposta_ia = chamar_ia(texto_usuario, SYSTEM_INSTRUCTION)
         
-        # --- NOVO: Verificação de segurança ---
-        if not resposta_ia or "Erro" in resposta_ia or "Ops" in resposta_ia:
-            bot.reply_to(message, "Tive um probleminha técnico com a IA. Pode tentar de novo?")
+        if not resposta_ia:
+            bot.reply_to(message, "Tive um erro na IA.")
             return
-        # ---------------------------------------
 
-        # Linha 954: REMOVIDO o .text
-        print(f"[{user_id}] IA: {resposta_ia}") 
+        print(f"[{user_id}] IA bruta: {resposta_ia}")
+
+        # --- AQUI ESTÁ A LIMPEZA (Adicione estas linhas) ---
+        json_limpo = resposta_ia.replace('```json', '').replace('```', '').strip()
         
-        # Linha 955: REMOVIDO o .text
-        dados = json.loads(resposta_ia)
+        try:
+            dados = json.loads(json_limpo)
+        except Exception as e:
+            print(f"Erro ao converter JSON: {e}")
+            bot.reply_to(message, "A IA mandou um formato que eu não entendi. Tente de novo!")
+            return
+        # --------------------------------------------------
 
         if intencao == "registrar_gasto":
             valor = parse_valor(dados.get("valor"))
