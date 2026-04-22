@@ -19,14 +19,11 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 
 def chamar_ia(contents, system_instruction):
     try:
-        # Truque de mestre: juntamos a instrução no topo do prompt
-        # Isso garante que funcione em qualquer versão da biblioteca
-        prompt_completo = f"CONTEXTO/INSTRUÇÃO: {system_instruction}\n\nENTRADA DO USUÁRIO: {contents}"
+        # Simplificando ao máximo: juntamos tudo em um texto só
+        prompt_completo = f"INSTRUÇÃO: {system_instruction}\n\nENTRADA DO USUÁRIO: {contents}"
         
-        response = model.generate_content(
-            prompt_completo,
-            generation_config={"response_mime_type": "application/json"}
-        )
+        # Chamada direta, sem configurações extras que podem dar erro 404
+        response = model.generate_content(prompt_completo)
         
         if response and response.text:
             return response.text
