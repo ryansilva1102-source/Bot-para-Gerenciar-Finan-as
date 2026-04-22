@@ -19,19 +19,16 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 
 def chamar_ia(contents, system_instruction):
     try:
-        # Colocamos tudo num texto só, que é o jeito que a v1beta entende melhor
-        prompt = f"Instrução: {system_instruction}\nUsuário: {contents}"
-        
+        prompt = f"{system_instruction}\n\nEntrada: {contents}"
         response = model.generate_content(prompt)
         
-        # Verificação de segurança: a resposta existe? Tem texto?
+        # O SEGREDO: Já retornamos o TEXTO pronto aqui
         if response and hasattr(response, 'text'):
             return response.text
-            
-        return "Desculpe, tive um problema para processar isso agora."
+        return "🤖 Ops, não consegui gerar uma resposta agora."
     except Exception as e:
         print(f"Erro na IA: {e}")
-        return "Erro técnico na resposta."
+        return f"⚠️ Erro técnico: {e}"
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "financas.db")
 
@@ -945,7 +942,7 @@ def processar_foto(message):
         bot.reply_to(message, "Tive um problema pra ler a foto. Pode tentar de novo?")
 
 @bot.message_handler(func=lambda message: True)
-def processar_mensagem(message):
+def responder(message):
     registrar_usuario(message.chat.id)
     user_id = message.chat.id
     texto_usuario = message.text
@@ -953,10 +950,20 @@ def processar_mensagem(message):
     try:
         bot.send_chat_action(message.chat.id, "typing")
 
+        # Linha 953: Chama a IA normalmente
         resposta_ia = chamar_ia(texto_usuario, SYSTEM_INSTRUCTION)
-        print(f"[{user_id}] IA: {resposta_ia.text}")
-        dados = json.loads(resposta_ia.text)
-        intencao = dados.get("intencao", "conversa")
+        
+        # --- NOVO: Verificação de segurança ---
+        if not resposta_ia or "Erro" in resposta_ia or "Ops" in resposta_ia:
+            bot.reply_to(message, "Tive um probleminha técnico com a IA. Pode tentar de novo?")
+            return
+        # ---------------------------------------
+
+        # Linha 954: REMOVIDO o .text
+        print(f"[{user_id}] IA: {resposta_ia}") 
+        
+        # Linha 955: REMOVIDO o .text
+        dados = json.loads(resposta_ia)
 
         if intencao == "registrar_gasto":
             valor = parse_valor(dados.get("valor"))
