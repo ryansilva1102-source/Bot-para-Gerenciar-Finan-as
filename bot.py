@@ -7,40 +7,28 @@ from datetime import datetime, timedelta
 
 import schedule
 import telebot
-from google import genai
-from google.genai import types
-from flask import Flask # <-- IMPORTAÇÃO DO FLASK ADICIONADA AQUI
+import google.generativeai as genai
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-1.5-flash"
-MODEL_FALLBACK = "gemini-1.5-flash-8b"
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 def chamar_ia(contents, system_instruction):
-    """Chama o Gemini com retry e fallback de modelo em caso de sobrecarga."""
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        response_mime_type="application/json",
-    )
-    ultima_excecao = None
-    for modelo in (MODEL_NAME, MODEL_NAME, MODEL_FALLBACK):
-        try:
-            return client.models.generate_content(
-                model=modelo, contents=contents, config=config
-            )
-        except Exception as e:
-            ultima_excecao = e
-            msg = str(e)
-            if "503" in msg or "UNAVAILABLE" in msg or "overloaded" in msg.lower():
-                print(f"Gemini sobrecarregado ({modelo}), tentando de novo...")
-                time.sleep(2)
-                continue
-            raise
-    raise ultima_excecao
+    try:
+        # Chamada estável usando o modelo que você definiu na linha 18
+        response = model.generate_content(
+            contents,
+            generation_config={"response_mime_type": "application/json"},
+            system_instruction=system_instruction
+        )
+        return response.text
+    except Exception as e:
+        print(f"Erro na IA: {e}")
+        return None
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "financas.db")
 
