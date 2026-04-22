@@ -19,13 +19,18 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 
 def chamar_ia(contents, system_instruction):
     try:
-        # Chamada estável usando o modelo que você definiu na linha 18
+        # Truque de mestre: juntamos a instrução no topo do prompt
+        # Isso garante que funcione em qualquer versão da biblioteca
+        prompt_completo = f"CONTEXTO/INSTRUÇÃO: {system_instruction}\n\nENTRADA DO USUÁRIO: {contents}"
+        
         response = model.generate_content(
-            contents,
-            generation_config={"response_mime_type": "application/json"},
-            system_instruction=system_instruction
+            prompt_completo,
+            generation_config={"response_mime_type": "application/json"}
         )
-        return response.text
+        
+        if response and response.text:
+            return response.text
+        return None
     except Exception as e:
         print(f"Erro na IA: {e}")
         return None
