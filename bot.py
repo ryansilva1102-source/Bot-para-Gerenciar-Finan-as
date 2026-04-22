@@ -945,33 +945,41 @@ def processar_foto(message):
 
 @bot.message_handler(func=lambda message: True)
 def responder(message):
-    registrar_usuario(message.chat.id)
     user_id = message.chat.id
-    texto_usuario = message.text
-
     try:
-        bot.send_chat_action(message.chat.id, "typing")
-
-        # Linha 953: Chama a IA normalmente
-       # Chama a IA
-        resposta_ia = chamar_ia(texto_usuario, SYSTEM_INSTRUCTION)
+        bot.send_chat_action(user_id, "typing")
+        resposta_bruta = chamar_ia(message.text, SYSTEM_INSTRUCTION)
         
-        if not resposta_ia:
-            bot.reply_to(message, "Tive um erro na IA.")
+        if not resposta_bruta:
+            bot.reply_to(message, "Tive um problema com a IA. Tente de novo!")
             return
 
-        print(f"[{user_id}] IA bruta: {resposta_ia}")
-
-        # --- AQUI ESTÁ A LIMPEZA (Adicione estas linhas) ---
-        json_limpo = resposta_ia.replace('```json', '').replace('```', '').strip()
+        # Limpeza agressiva das crases (```json) que o Gemini envia
+        json_limpo = resposta_bruta.replace('```json', '').replace('```', '').strip()
         
-        try:
-            dados = json.loads(json_limpo)
-        except Exception as e:
-            print(f"Erro ao converter JSON: {e}")
-            bot.reply_to(message, "A IA mandou um formato que eu não entendi. Tente de novo!")
-            return
-        # --------------------------------------------------
+        # Carrega os dados e já define a intenção com um valor padrão
+        dados = json.loads(json_limpo)
+        intencao = dados.get("intencao", "conversa") 
+
+        if intencao == "registrar_gasto":
+            valor = float(str(dados.get("valor", 0)).replace(',', '.'))
+            if valor > 0:
+                categoria = dados.get("categoria", "Outros")
+                descricao = dados.get("descricao", "")
+                metodo = dados.get("metodo_pagamento", "Não informado")
+                
+                salvar_gasto(user_id, valor, categoria, descricao, metodo)
+                bot.reply_to(message, f"✅ Anotado!\n💰 R$ {valor:.2f}\n📂 {categoria}")
+            else:
+                bot.reply_to(message, "Não entendi o valor. Quanto foi?")
+        else:
+            # Resposta para quando for apenas conversa
+            msg = dados.get("descricao") or "Entendi! Como posso ajudar mais?"
+            bot.reply_to(message, msg)
+
+    except Exception as e:
+        print(f"Erro no processamento: {e}")
+        bot.reply_to(message, "Eita, deu um erro técnico aqui ao tentar processar.")
 
         if intencao == "registrar_gasto":
             valor = parse_valor(dados.get("valor"))
