@@ -11,8 +11,8 @@ from google import genai
 from google.genai import types
 from flask import Flask # <-- IMPORTAÇÃO DO FLASK ADICIONADA AQUI
 
-TELEGRAM_TOKEN = os.environ["8262213190:AAGNZfXEUf7gg2tRm3T5JM97lnsrxIbBhGw"]
-GEMINI_API_KEY = os.environ["AIzaSyA-o4Oa1Ob3AkBP_FEHnJI1lYdpQx2vbm8"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
