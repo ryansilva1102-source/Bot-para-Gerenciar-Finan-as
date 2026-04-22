@@ -15,24 +15,23 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-pro")
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 def chamar_ia(contents, system_instruction):
     try:
-        # Juntamos tudo em um prompt só para evitar erros de versão da API
-        prompt_completo = f"INSTRUÇÃO: {system_instruction}\n\nENTRADA: {contents}"
+        # Colocamos tudo num texto só, que é o jeito que a v1beta entende melhor
+        prompt = f"Instrução: {system_instruction}\nUsuário: {contents}"
         
-        response = model.generate_content(prompt_completo)
+        response = model.generate_content(prompt)
         
-        # Só tentamos ler o texto se a resposta for válida
-        if response and hasattr(response, 'text') and response.text:
+        # Verificação de segurança: a resposta existe? Tem texto?
+        if response and hasattr(response, 'text'):
             return response.text
             
-        print("A IA retornou uma resposta vazia ou bloqueada.")
-        return None
+        return "Desculpe, tive um problema para processar isso agora."
     except Exception as e:
         print(f"Erro na IA: {e}")
-        return None
+        return "Erro técnico na resposta."
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "financas.db")
 
