@@ -1206,16 +1206,6 @@ def scheduler_loop():
             print(f"Erro no scheduler: {e}")
         time.sleep(30)
 
-# ================= TRUQUE PARA O RENDER (FLASK) =================
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "O bot de controle financeiro está online na nuvem!"
-
-def rodar_bot():
-    print("🤖 Bot Telegram rodando em segundo plano...")
-    bot.infinity_polling()
 
 # ================= INICIALIZAÇÃO =================
 if __name__ == "__main__":
