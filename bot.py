@@ -15,21 +15,21 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel("gemini-2.5-flash")
 
-def chamar_ia(contents, system_instruction):
+def chamar_ia(contents):
+    system_instruction = "Você é um assistente financeiro. Responda APENAS um JSON: {'intencao': 'registrar_gasto' ou 'conversa', 'valor': float, 'categoria': string, 'descricao': string, 'metodo_pagamento': string}"
     try:
-        prompt = f"{system_instruction}\n\nEntrada: {contents}"
+        # Usamos o prompt unificado que funcionou no diagnóstico
+        prompt = f"{system_instruction}\n\nEntrada do usuário: {contents}"
         response = model.generate_content(prompt)
         
-        # O SEGREDO: Já retornamos o TEXTO pronto aqui
         if response and hasattr(response, 'text'):
             return response.text
-        return "🤖 Ops, não consegui gerar uma resposta agora."
+        return None
     except Exception as e:
         print(f"Erro na IA: {e}")
-        return f"⚠️ Erro técnico: {e}"
-
+        return None
 DB_PATH = os.path.join(os.path.dirname(__file__), "financas.db")
 
 # ================= BANCO DE DADOS =================
