@@ -17,11 +17,13 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
-def chamar_ia(contents):
-    system_instruction = "Você é um assistente financeiro. Responda APENAS um JSON: {'intencao': 'registrar_gasto' ou 'conversa', 'valor': float, 'categoria': string, 'descricao': string, 'metodo_pagamento': string}"
+# Mude de: def chamar_ia(contents):
+# Para:
+def chamar_ia(contents, system_instruction):
+    instrucao_interna = "Você é um assistente financeiro. Responda APENAS um JSON: {'intencao': 'registrar_gasto' ou 'conversa', 'valor': float, 'categoria': string, 'descricao': string, 'metodo_pagamento': string}"
     try:
-        # Usamos o prompt unificado que funcionou no diagnóstico
-        prompt = f"{system_instruction}\n\nEntrada do usuário: {contents}"
+        # Usamos a instrução interna para garantir que o Gemini 2.5 não se perca
+        prompt = f"{instrucao_interna}\n\nEntrada do usuário: {contents}"
         response = model.generate_content(prompt)
         
         if response and hasattr(response, 'text'):
