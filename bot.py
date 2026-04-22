@@ -17,8 +17,8 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-1.5-flash"
-MODEL_FALLBACK = "gemini-1.5-flash-8b"
+MODEL_NAME = "models/gemini-1.5-flash"
+MODEL_FALLBACK = "models/gemini-1.5-flash-8b"
 
 def chamar_ia(contents, system_instruction):
     """Chama o Gemini com retry e fallback de modelo em caso de sobrecarga."""
