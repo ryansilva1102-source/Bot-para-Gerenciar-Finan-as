@@ -15,18 +15,20 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel("gemini-1.5-pro")
 
 def chamar_ia(contents, system_instruction):
     try:
-        # Simplificando ao máximo: juntamos tudo em um texto só
-        prompt_completo = f"INSTRUÇÃO: {system_instruction}\n\nENTRADA DO USUÁRIO: {contents}"
+        # Juntamos tudo em um prompt só para evitar erros de versão da API
+        prompt_completo = f"INSTRUÇÃO: {system_instruction}\n\nENTRADA: {contents}"
         
-        # Chamada direta, sem configurações extras que podem dar erro 404
         response = model.generate_content(prompt_completo)
         
-        if response and response.text:
+        # Só tentamos ler o texto se a resposta for válida
+        if response and hasattr(response, 'text') and response.text:
             return response.text
+            
+        print("A IA retornou uma resposta vazia ou bloqueada.")
         return None
     except Exception as e:
         print(f"Erro na IA: {e}")
