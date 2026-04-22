@@ -954,12 +954,18 @@ def responder(message):
             bot.reply_to(message, "Tive um problema com a IA. Tente de novo!")
             return
 
-        # Limpeza agressiva das crases (```json) que o Gemini envia
+                # Limpeza agressiva das crases (```json) que o Gemini envia
         json_limpo = resposta_bruta.replace('```json', '').replace('```', '').strip()
         
-        # Carrega os dados e já define a intenção com um valor padrão
-        dados = json.loads(json_limpo)
-        intencao = dados.get("intencao", "conversa") 
+        try:
+            # Tenta ler o formato JSON
+            dados = json.loads(json_limpo)
+            intencao = dados.get("intencao", "conversa")
+            resposta_conversa = dados.get("descricao")
+        except Exception:
+            # Se a IA respondeu fora do formato JSON (ex: só falou "Olá! Tudo bem?")
+            intencao = "conversa"
+            resposta_conversa = json_limpo
 
         if intencao == "registrar_gasto":
             valor = float(str(dados.get("valor", 0)).replace(',', '.'))
@@ -973,13 +979,14 @@ def responder(message):
             else:
                 bot.reply_to(message, "Não entendi o valor. Quanto foi?")
         else:
-            # Resposta para quando for apenas conversa
-            msg = dados.get("descricao") or "Entendi! Como posso ajudar mais?"
+            # Resposta para quando for apenas conversa ("Oi")
+            msg = resposta_conversa if resposta_conversa else "Olá! Pode me falar os seus gastos que eu anoto para você (Ex: 'Gastei 20 no BK')."
             bot.reply_to(message, msg)
 
     except Exception as e:
-        print(f"Erro no processamento: {e}")
-        bot.reply_to(message, "Eita, deu um erro técnico aqui ao tentar processar.")
+        print(f"Erro geral: {e}")
+        bot.reply_to(message, "Eita, deu um erro técnico aqui.")
+
 
         if intencao == "registrar_gasto":
             valor = parse_valor(dados.get("valor"))
