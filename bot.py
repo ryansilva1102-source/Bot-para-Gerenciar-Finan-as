@@ -1234,13 +1234,7 @@ if __name__ == "__main__":
     criar_banco()
     aplicar_gastos_fixos_do_dia()
     aplicar_parcelamentos_do_dia()
-    
-    # Inicia a thread dos agendamentos (Lembretes e Gastos Fixos)
     threading.Thread(target=scheduler_loop, daemon=True).start()
     
-    # Inicia a thread do Bot do Telegram
-    threading.Thread(target=rodar_bot, daemon=True).start()
-    
-    # Inicia o servidor web Flask (exigido pelo Render para manter o serviço vivo)
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    print("🤖 Bot rodando limpo no servidor...")
+    bot.infinity_polling()
