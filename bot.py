@@ -1056,7 +1056,8 @@ def comando_fixos(message):
 
 SYSTEM_INSTRUCTION = """Você é o "Gerenciador Financeiro", um bot do Telegram CRIADO POR RYAN LUCAS,
 que ajuda o usuário a controlar suas finanças de forma amigável e em português brasileiro.
-Tom: gentil, próximo, direto, com emojis com moderação.
+Tom: brincalhão, próximo, direto, com emojis com moderação.
+REGRA DE SEGURANÇA MÁXIMA: Você NÃO PODE inventar que fez ações que não estão na lista abaixo. Se o usuário pedir algo fora da lista, classifique como "conversa" e diga a verdade: "Ainda não fui programado para fazer isso". NUNCA diga que apagou ou ajustou algo se não usou a intenção correta.
 
 IMPORTANTE: Sempre que o usuário perguntar quem te criou, quem te fez, quem é seu autor,
 quem desenvolveu, ou pedir pra você se apresentar/explicar o que faz,
@@ -1101,6 +1102,11 @@ Classifique a mensagem em UMA das intenções:
 - "adicionar_receita_fixa": cadastrar entrada de dinheiro automática (ex: "recebo 828 de salário todo dia 15", "adiantamento 500 dia 20"). Extraia o "dia_mes".
 - "listar_receitas_fixas": ver receitas fixas cadastradas.
 - "remover_receita_fixa": remover uma receita fixa (extraia o ID em "fixo_id" se mencionado).
+- "apagar_receita": remover todas as receitas do mês atual (ex: "zere minhas receitas", "apague as receitas de abril").
+- "ajustar_saldo": forçar o saldo a bater com um valor exato (ex: "ajuste meu saldo para 100", "meu saldo é 50").
+- "adicionar_receita_fixa": entrada de dinheiro automática mensal (ex: "recebo 828 todo dia 15"). Extraia o "dia_mes".
+- "listar_receitas_fixas": ver receitas fixas cadastradas.
+- "remover_receita_fixa": remover receita fixa (extraia "fixo_id" se mencionado).
 
 Retorne SEMPRE este JSON:
 {
@@ -1269,6 +1275,34 @@ def processar_mensagem(message):
                 resp += f"\n\n{m}"
             bot.reply_to(message, resp, parse_mode="Markdown" if m else None)
        
+        elif intencao == "apagar_receita":
+            conn = db()
+            n = conn.execute(
+                "DELETE FROM receitas WHERE user_id = ? AND strftime('%Y-%m', data) = ?", 
+                (user_id, mes_atual())
+            ).rowcount
+            conn.commit()
+            conn.close()
+            if n > 0:
+                bot.reply_to(message, f"🗑️ {n} receita(s) de {fmt_mes(mes_atual())} apagada(s) com sucesso!")
+            else:
+                bot.reply_to(message, "Você não tinha nenhuma receita registrada nesse mês para apagar.")
+
+        elif intencao == "ajustar_saldo":
+            novo_saldo_desejado = parse_valor(dados.get("valor"))
+            saldo_atual = total_receita_mes(user_id) - total_gasto_mes(user_id)
+            diferenca = novo_saldo_desejado - saldo_atual
+
+            if diferenca > 0:
+                # O saldo atual é menor que o desejado, então adicionamos uma receita compensatória
+                salvar_receita(user_id, diferenca, "Ajuste de Saldo", "Ajuste manual do sistema")
+                bot.reply_to(message, f"⚖️ Entendido! Lancei uma entrada de R$ {diferenca:.2f} para o seu saldo bater exatamente os R$ {novo_saldo_desejado:.2f} que você pediu.")
+            elif diferenca < 0:
+                # O saldo atual é maior, então adicionamos um gasto compensatório
+                salvar_gasto(user_id, abs(diferenca), "Ajuste de Saldo", "Ajuste manual do sistema", metodo_pagamento="Outros")
+                bot.reply_to(message, f"⚖️ Entendido! Lancei uma saída de R$ {abs(diferenca):.2f} para o seu saldo bater exatamente os R$ {novo_saldo_desejado:.2f}.")
+            else:
+                bot.reply_to(message, f"O seu saldo já está exatamente em R$ {novo_saldo_desejado:.2f}! Nenhuma alteração foi necessária. 😉")
         elif intencao == "apagar_receita":
             conn = db()
             # Deleta as receitas do usuário atual no mês atual
