@@ -987,76 +987,115 @@ def gerar_relatorio(message):
     agora = datetime.now()
     hoje_str = agora.strftime("%Y-%m-%d %H:%M:%S")
     mes = mes_atual()
+    dia_atual = agora.day
 
     conn = db()
-    # 1. Busca Gastos Realizados (até agora)
+    
+    # 1. Gastos que já aconteceram (até agora)
     gastos_reais = conn.execute(
         "SELECT SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data <= ?",
         (user_id, mes, hoje_str)
     ).fetchone()[0] or 0.0
 
-    # 2. Busca Gastos Futuros (agendados para depois de agora)
-    gastos_futuros = conn.execute(
+    # 2. Gastos futuros (lançados com data futura no banco principal)
+    gastos_futuros_pontuais = conn.execute(
         "SELECT SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data > ?",
         (user_id, mes, hoje_str)
     ).fetchone()[0] or 0.0
 
-    receitas_mes = total_receita_mes(user_id, mes)
-    total_geral = conn.execute(
-        "SELECT SUM(valor) FROM gastos WHERE user_id = ?", (user_id,)
+    # 3. Gastos Fixos que ainda vão cair este mês (dia_mes >= hoje e ainda não aplicados neste mês)
+    gastos_fixos_futuros = conn.execute(
+        """SELECT SUM(valor) FROM gastos_fixos 
+           WHERE user_id = ? AND dia_mes >= ? 
+           AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+        (user_id, dia_atual, mes)
     ).fetchone()[0] or 0.0
 
-    # Listas detalhadas (mantendo seu código original)
+    # 4. Parcelamentos que ainda vão cair este mês
+    parcelas_futuras = conn.execute(
+        """SELECT SUM(valor_parcela) FROM parcelamentos 
+           WHERE user_id = ? AND dia_cobranca >= ? 
+           AND parcelas_pagas < total_parcelas 
+           AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+        (user_id, dia_atual, mes)
+    ).fetchone()[0] or 0.0
+
+    gastos_futuros = gastos_futuros_pontuais + gastos_fixos_futuros + parcelas_futuras
+    
+    receitas_mes = total_receita_mes(user_id, mes)
+    
+    # --- BUSCAS PARA DETALHAMENTO ---
     por_categoria = conn.execute(
-        "SELECT categoria, SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? GROUP BY categoria ORDER BY SUM(valor) DESC",
-        (user_id, mes)
+        """SELECT categoria, SUM(valor) FROM gastos
+           WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data <= ?
+           GROUP BY categoria ORDER BY SUM(valor) DESC""",
+        (user_id, mes, hoje_str),
+    ).fetchall()
+    ultimos_gastos = conn.execute(
+        """SELECT data, valor, categoria, descricao FROM gastos
+           WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data <= ?
+           ORDER BY id DESC LIMIT 10""",
+        (user_id, mes, hoje_str),
     ).fetchall()
     
     por_fonte = conn.execute(
-        "SELECT fonte, SUM(valor) FROM receitas WHERE user_id = ? AND strftime('%Y-%m', data) = ? GROUP BY fonte ORDER BY SUM(valor) DESC",
-        (user_id, mes)
+        """SELECT fonte, SUM(valor) FROM receitas
+           WHERE user_id = ? AND strftime('%Y-%m', data) = ?
+           GROUP BY fonte ORDER BY SUM(valor) DESC""",
+        (user_id, mes),
     ).fetchall()
-    
     ultimas_receitas = conn.execute(
-        "SELECT data, valor, fonte, descricao FROM receitas WHERE user_id = ? AND strftime('%Y-%m', data) = ? ORDER BY id DESC LIMIT 10",
-        (user_id, mes)
-    ).fetchall()
-    
-    ultimos_gastos = conn.execute(
-        "SELECT data, valor, categoria, descricao FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? ORDER BY id DESC LIMIT 10",
-        (user_id, mes)
+        """SELECT data, valor, fonte, descricao FROM receitas
+           WHERE user_id = ? AND strftime('%Y-%m', data) = ?
+           ORDER BY id DESC LIMIT 10""",
+        (user_id, mes),
     ).fetchall()
     conn.close()
 
-    # Cálculos de Saldo
     saldo_atual = receitas_mes - gastos_reais
     saldo_previsto = receitas_mes - (gastos_reais + gastos_futuros)
 
-    # Montagem do Texto (Seu layout com as novas infos)
+    # Monta o texto do Extrato
     texto = f"📊 *Relatório e Extrato de {fmt_mes(mes)}*\n"
     texto += f"💵 *Receitas:* R$ {receitas_mes:.2f}\n"
     texto += f"💸 *Gastos realizados:* R$ {gastos_reais:.2f}\n"
     texto += f"⏳ *Gastos futuros:* R$ {gastos_futuros:.2f}\n"
-    texto += f"💰 *Saldo Atual:* R$ {saldo_atual:.2f}\n"
-    texto += f"🔮 *Saldo Previsto:* R$ {saldo_previsto:.2f}\n"
-    texto += f"📚 Gasto total (histórico): R$ {total_geral:.2f}\n"
+    texto += f"\n💰 *Saldo Atual:* R$ {saldo_atual:.2f}\n"
+    texto += f"🔮 *Saldo Previsto (Final do mês):* R$ {saldo_previsto:.2f}\n"
 
-    # Seções de detalhamento (sua lógica original de image_076c06.png)
     if por_fonte or ultimas_receitas:
         texto += "\n🟢 *DETALHAMENTO DE ENTRADAS*\n"
-        for fonte, tot in por_fonte:
-            pct = (tot / receitas_mes * 100) if receitas_mes > 0 else 0
-            texto += f"• {fonte}: R$ {tot:.2f} ({pct:.0f}%)\n"
+        if por_fonte:
+            for fonte, tot in por_fonte:
+                pct = (tot / receitas_mes * 100) if receitas_mes > 0 else 0
+                texto += f"• {fonte}: R$ {tot:.2f} ({pct:.0f}%)\n"
+        if ultimas_receitas:
+            texto += "\n_Últimas entradas:_\n"
+            for data, valor, fonte, desc in ultimas_receitas:
+                try:
+                    dia = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%d/%m")
+                except Exception:
+                    dia = data
+                d = f" — {desc}" if desc else ""
+                texto += f"• {dia} | R$ {valor:.2f} | {fonte}{d}\n"
 
     if por_categoria or ultimos_gastos:
         texto += "\n🔴 *DETALHAMENTO DE SAÍDAS*\n"
-        for cat, tot in por_categoria:
-            total_gastos_mes = gastos_reais + gastos_futuros
-            pct = (tot / total_gastos_mes * 100) if total_gastos_mes > 0 else 0
-            texto += f"• {cat}: R$ {tot:.2f} ({pct:.0f}%)\n"
+        if por_categoria:
+            for cat, tot in por_categoria:
+                pct = (tot / gastos_reais * 100) if gastos_reais > 0 else 0
+                texto += f"• {cat}: R$ {tot:.2f} ({pct:.0f}%)\n"
+        if ultimos_gastos:
+            texto += "\n_Últimas saídas:_\n"
+            for data, valor, cat, desc in ultimos_gastos:
+                try:
+                    dia = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%d/%m")
+                except Exception:
+                    dia = data
+                d = f" — {desc}" if desc else ""
+                texto += f"• {dia} | R$ {valor:.2f} | {cat}{d}\n"
 
     bot.reply_to(message, texto, parse_mode="Markdown")
-
 
 @bot.message_handler(commands=["fixos"])
 def comando_fixos(message):
@@ -1106,7 +1145,7 @@ Classifique a mensagem em UMA das intenções:
   Em "dia_mes" o dia de cobrança da fatura (assuma dia 10 se não mencionado).
 - "listar_parcelamentos": ver compras parceladas em andamento.
 - "remover_parcelamento": cancelar parcelamento (extraia "parc_id").
-- "consultar_relatorio": ver extrato, entradas e saídas, detalhamento de receitas e gastos, categorias, histórico e relatório.
+- "consultar_relatorio": ver extrato, entradas e saídas, detalhamento, saldo, categorias, histórico e relatório.
 - "comparar_meses": comparar mês atual com o anterior.
 - "resumo_semanal": ver resumo da semana.
 - "apagar_ultimo": apagar/desfazer o último gasto registrado.
