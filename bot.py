@@ -1004,6 +1004,7 @@ Classifique a mensagem em UMA das intenções:
 - "registrar_gasto": despesa real (ex: "gastei 50 no mercado", "uber 20", "almoço 35 no crédito").
   Se o usuário mencionar forma de pagamento (crédito, débito, pix, dinheiro, boleto), extraia em "metodo_pagamento".
 - "registrar_receita": entrada de dinheiro (ex: "recebi 3000 de salário", "freela 500").
+- "apagar_receita": apagar/remover todas as receitas ou entradas de dinheiro do mês atual.
 - "definir_orcamento": definir/alterar orçamento do mês (ex: "orçamento de 2000").
 - "consultar_orcamento": ver orçamento ou quanto sobra.
 - "apagar_orcamento": remover o orçamento do mês.
@@ -1162,6 +1163,21 @@ def processar_mensagem(message):
             if m:
                 resp += f"\n\n{m}"
             bot.reply_to(message, resp, parse_mode="Markdown" if m else None)
+       
+        elif intencao == "apagar_receita":
+            conn = db()
+            # Deleta as receitas do usuário atual no mês atual
+            n = conn.execute(
+                "DELETE FROM receitas WHERE user_id = ? AND strftime('%Y-%m', data) = ?", 
+                (user_id, mes_atual())
+            ).rowcount
+            conn.commit()
+            conn.close()
+            
+            if n > 0:
+                bot.reply_to(message, f"🗑️ {n} receita(s) de {fmt_mes(mes_atual())} apagada(s) com sucesso! A casa tá limpa.")
+            else:
+                bot.reply_to(message, "Você não tinha nenhuma receita registrada nesse mês para apagar.")    
 
         elif intencao == "definir_orcamento":
             valor = parse_valor(dados.get("valor"))
