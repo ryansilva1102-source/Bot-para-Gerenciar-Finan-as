@@ -126,6 +126,13 @@ def criar_banco():
         )
     """)
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS autorizados (
+            chat_id INTEGER PRIMARY KEY,
+            nome TEXT,
+            autorizado_em TEXT
+        )
+    """)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS parcelamentos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -180,6 +187,47 @@ def criar_banco():
 
     conn.commit()
     conn.close()
+
+
+# ================= WHITELIST DE USUÁRIOS =================
+
+def usuario_autorizado(chat_id):
+    """Admin sempre tem acesso. Outros precisam estar na whitelist."""
+    if chat_id == ADMIN_CHAT_ID:
+        return True
+    conn = db()
+    row = conn.execute(
+        "SELECT 1 FROM autorizados WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def autorizar_usuario(chat_id, nome=None):
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO autorizados (chat_id, nome, autorizado_em) VALUES (?, ?, ?)",
+        (chat_id, nome or "", datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def desautorizar_usuario(chat_id):
+    conn = db()
+    n = conn.execute("DELETE FROM autorizados WHERE chat_id = ?", (chat_id,)).rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def listar_autorizados():
+    conn = db()
+    rows = conn.execute(
+        "SELECT chat_id, nome, autorizado_em FROM autorizados ORDER BY autorizado_em DESC"
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def registrar_usuario(chat_id):
@@ -1009,6 +1057,77 @@ def cmd_confirmar_reset(message):
 
 
 
+@bot.message_handler(commands=["autorizar"])
+def cmd_autorizar(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    partes = message.text.split(maxsplit=2)
+    if len(partes) < 2:
+        bot.reply_to(message, "Uso: `/autorizar <chat_id> [nome opcional]`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(partes[1])
+    except ValueError:
+        bot.reply_to(message, "chat_id inválido. Precisa ser um número.")
+        return
+    nome = partes[2] if len(partes) > 2 else None
+    autorizar_usuario(chat_id, nome)
+    extra = f" ({nome})" if nome else ""
+    bot.reply_to(message, f"✅ Usuário `{chat_id}`{extra} autorizado a usar o bot.", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["desautorizar"])
+def cmd_desautorizar(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    partes = message.text.split(maxsplit=1)
+    if len(partes) < 2:
+        bot.reply_to(message, "Uso: `/desautorizar <chat_id>`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(partes[1])
+    except ValueError:
+        bot.reply_to(message, "chat_id inválido. Precisa ser um número.")
+        return
+    n = desautorizar_usuario(chat_id)
+    if n:
+        bot.reply_to(message, f"🚫 Usuário `{chat_id}` removido da whitelist.", parse_mode="Markdown")
+    else:
+        bot.reply_to(message, f"Usuário `{chat_id}` não estava autorizado.", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["listar_autorizados"])
+def cmd_listar_autorizados(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    rows = listar_autorizados()
+    if not rows:
+        bot.reply_to(message, "Ninguém na whitelist (só você tem acesso).")
+        return
+    texto = f"✅ *Usuários autorizados ({len(rows)}):*\n"
+    for chat_id, nome, quando in rows:
+        try:
+            data_fmt = datetime.fromisoformat(quando).strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            data_fmt = quando or "?"
+        linha = f"\n• `{chat_id}` — {data_fmt}"
+        if nome:
+            linha += f" ({nome})"
+        texto += linha
+    bot.reply_to(message, texto, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["meu_id"])
+def cmd_meu_id(message):
+    """Comando público pra quem quer pedir acesso ao admin."""
+    bot.reply_to(
+        message,
+        f"Seu chat_id é: `{message.chat.id}`\n"
+        f"Mande esse número pro dono do bot pra pedir acesso.",
+        parse_mode="Markdown",
+    )
+
+
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
     if message.chat.id != ADMIN_CHAT_ID:
@@ -1301,8 +1420,16 @@ Se a mensagem for ambígua (ex: só "20"), use intencao "conversa" e peça detal
 
 @bot.message_handler(content_types=["photo"])
 def processar_foto(message):
-    registrar_usuario(message.chat.id)
     user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        bot.reply_to(
+            message,
+            "🔒 Esse bot é privado. Pra pedir acesso, mande seu chat_id "
+            f"(`{user_id}`) pro dono.",
+            parse_mode="Markdown",
+        )
+        return
+    registrar_usuario(user_id)
     print(f"[{user_id}] 📸 Foto recebida")
     try:
         bot.send_chat_action(message.chat.id, "typing")
@@ -1355,8 +1482,16 @@ def processar_foto(message):
 
 @bot.message_handler(func=lambda message: True)
 def processar_mensagem(message):
-    registrar_usuario(message.chat.id)
     user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        bot.reply_to(
+            message,
+            "🔒 Esse bot é privado. Pra pedir acesso, mande seu chat_id "
+            f"(`{user_id}`) pro dono.",
+            parse_mode="Markdown",
+        )
+        return
+    registrar_usuario(user_id)
     texto_usuario = message.text
 
     try:
