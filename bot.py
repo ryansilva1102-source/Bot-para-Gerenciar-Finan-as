@@ -819,6 +819,103 @@ def comparar_meses_texto(user_id):
     )
 
 
+# ================= RESUMO DIÁRIO =================
+
+def resumo_diario_texto(user_id, dia=None, tipo="ambos"):
+    """
+    Retorna entradas e/ou saídas de um dia específico.
+    dia: 'YYYY-MM-DD' ou None (hoje)
+    tipo: 'gastos', 'receitas' ou 'ambos'
+    """
+    if dia is None:
+        dia = datetime.now().strftime("%Y-%m-%d")
+    inicio = f"{dia} 00:00:00"
+    fim = f"{dia} 23:59:59"
+
+    try:
+        data_pt = datetime.strptime(dia, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return "Não entendi a data. Tenta 'gastos de hoje', 'extrato de ontem' ou 'movimentações do dia 15/04'."
+
+    hoje_str = datetime.now().strftime("%Y-%m-%d")
+    ontem_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if dia == hoje_str:
+        rotulo = "hoje"
+    elif dia == ontem_str:
+        rotulo = "ontem"
+    else:
+        rotulo = data_pt
+
+    conn = db()
+    gastos = []
+    receitas = []
+    if tipo in ("gastos", "ambos"):
+        gastos = conn.execute(
+            """SELECT data, valor, categoria, descricao, metodo_pagamento
+               FROM gastos WHERE user_id = ? AND data >= ? AND data <= ?
+               ORDER BY data ASC""",
+            (user_id, inicio, fim),
+        ).fetchall()
+    if tipo in ("receitas", "ambos"):
+        receitas = conn.execute(
+            """SELECT data, valor, fonte, descricao
+               FROM receitas WHERE user_id = ? AND data >= ? AND data <= ?
+               ORDER BY data ASC""",
+            (user_id, inicio, fim),
+        ).fetchall()
+    conn.close()
+
+    total_g = sum(r[1] for r in gastos)
+    total_r = sum(r[1] for r in receitas)
+
+    if not gastos and not receitas:
+        if tipo == "gastos":
+            return f"Você não registrou nenhum gasto {rotulo}. 🎉"
+        if tipo == "receitas":
+            return f"Você não registrou nenhuma receita {rotulo}."
+        return f"Você não tem movimentação registrada {rotulo}."
+
+    titulo_tipo = {
+        "gastos": "Saídas",
+        "receitas": "Entradas",
+        "ambos": "Movimentações",
+    }[tipo]
+    texto = f"📅 *{titulo_tipo} de {rotulo}* ({data_pt})\n"
+
+    if receitas:
+        texto += f"\n💵 *Entradas — R$ {total_r:.2f}*"
+        for data, valor, fonte, desc in receitas:
+            try:
+                hora = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
+            except Exception:
+                hora = ""
+            linha = f"\n  • {hora} R$ {valor:.2f} — {fonte}"
+            if desc:
+                linha += f" ({desc})"
+            texto += linha
+
+    if gastos:
+        texto += f"\n\n💸 *Saídas — R$ {total_g:.2f}* ({len(gastos)} lançamentos)"
+        for data, valor, cat, desc, metodo in gastos:
+            try:
+                hora = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
+            except Exception:
+                hora = ""
+            linha = f"\n  • {hora} R$ {valor:.2f} — {cat}"
+            if desc:
+                linha += f" ({desc})"
+            if metodo:
+                linha += f" • {metodo}"
+            texto += linha
+
+    if tipo == "ambos" and (gastos or receitas):
+        saldo = total_r - total_g
+        emoji = "📈" if saldo >= 0 else "📉"
+        texto += f"\n\n{emoji} *Saldo do dia: R$ {saldo:.2f}*"
+
+    return texto
+
+
 # ================= RESUMO SEMANAL =================
 
 def resumo_semanal_texto(user_id):
@@ -1166,6 +1263,12 @@ Classifique a mensagem em UMA das intenções:
 - "listar_receitas_fixas": ver receitas fixas cadastradas.
 - "remover_receita_fixa": remover receita fixa (extraia "fixo_id" se mencionado).
 - "listar_gastos_futuros": listar ou mostrar contas a pagar, gastos futuros, agendados, ou o que falta pagar neste mês.
+- "resumo_diario": usuário pede para ver entradas, saídas, gastos ou receitas de um dia específico
+  (ex: "meus gastos de hoje", "o que entrou hoje", "extrato de ontem", "gastos do dia 15", "movimentações de hoje", "quanto gastei hoje?").
+  Em "tipo_dia" coloque "gastos" se pedir só saídas/gastos, "receitas" se pedir só entradas/receitas,
+  ou "ambos" se pedir extrato/movimentação/resumo do dia inteiro.
+  Em "data_futura" coloque a data no formato YYYY-MM-DD se o usuário mencionar dia específico
+  (use a data de HOJE se ele disser "hoje" ou não mencionar dia, e a data de ONTEM se disser "ontem").
 
 Retorne SEMPRE este JSON:
 {
@@ -1181,6 +1284,7 @@ Retorne SEMPRE este JSON:
   "parc_id": <int ou null>,
   "texto": "<palavra-chave pra busca, vazio se não aplicável>",
   "periodo": "<esse_mes|mes_passado|semana|tudo — pra busca>",
+  "tipo_dia": "<gastos|receitas|ambos ou vazio — pra resumo_diario>",
   "data_futura": "<YYYY-MM-DD ou null>",
   "resposta": "<texto curto e amigável em PT-BR — preencha em 'conversa' ou pra pedir esclarecimento>"
 }
@@ -1625,6 +1729,17 @@ def processar_mensagem(message):
 
                 bot.reply_to(message, texto, parse_mode="Markdown")
                 
+        elif intencao == "resumo_diario":
+            tipo_dia = (dados.get("tipo_dia") or "ambos").strip().lower()
+            if tipo_dia not in ("gastos", "receitas", "ambos"):
+                tipo_dia = "ambos"
+            dia = (dados.get("data_futura") or "").strip() or None
+            bot.reply_to(
+                message,
+                resumo_diario_texto(user_id, dia=dia, tipo=tipo_dia),
+                parse_mode="Markdown",
+            )
+
         elif intencao == "desativar_lembrete":
             definir_lembrete(user_id, False)
             bot.reply_to(message, "🔕 Lembretes diários desativados. Pode reativar a qualquer momento dizendo 'ativa lembrete'.")
