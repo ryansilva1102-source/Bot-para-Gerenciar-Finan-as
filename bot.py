@@ -20,23 +20,33 @@ MODEL_NAME = "gemini-2.5-flash-lite"
 MODEL_FALLBACK = "gemini-2.5-flash"
 
 
-def chamar_ia(contents, system_instruction):
-    """Chama o Gemini com retry e fallback de modelo em caso de sobrecarga."""
+memoria_usuarios = {}
+
+def chamar_ia(user_id, contents, system_instruction):
+    """Chama o Gemini mantendo o histórico de conversa com retry."""
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         response_mime_type="application/json",
     )
+    
+    # Se for a primeira vez do usuário, cria uma sessão com memória
+    if user_id not in memoria_usuarios:
+        memoria_usuarios[user_id] = client.chats.create(
+            model=MODEL_NAME, 
+            config=config
+        )
+        
+    chat = memoria_usuarios[user_id]
     ultima_excecao = None
-    for modelo in (MODEL_NAME, MODEL_NAME, MODEL_FALLBACK):
+    
+    for _ in range(3): # Tenta até 3 vezes se der erro de sobrecarga
         try:
-            return client.models.generate_content(
-                model=modelo, contents=contents, config=config
-            )
+            return chat.send_message(contents)
         except Exception as e:
             ultima_excecao = e
             msg = str(e)
             if "503" in msg or "UNAVAILABLE" in msg or "overloaded" in msg.lower():
-                print(f"Gemini sobrecarregado ({modelo}), tentando de novo...")
+                print(f"Gemini sobrecarregado, tentando de novo...")
                 time.sleep(2)
                 continue
             raise
@@ -803,6 +813,9 @@ def apagar_dados_usuario(user_id):
         conn.execute(f"DELETE FROM {tabela} WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
+    
+    # Adicione esta linha para zerar a memória da IA também:
+    memoria_usuarios.pop(user_id, None)
 
 
 @bot.message_handler(commands=["resetar", "reiniciar"])
@@ -1108,7 +1121,7 @@ def processar_mensagem(message):
     try:
         bot.send_chat_action(message.chat.id, "typing")
 
-        resposta_ia = chamar_ia(texto_usuario, SYSTEM_INSTRUCTION)
+        resposta_ia = chamar_ia(user_id, texto_usuario, SYSTEM_INSTRUCTION)
         print(f"[{user_id}] IA: {resposta_ia.text}")
         dados = json.loads(resposta_ia.text)
         intencao = dados.get("intencao", "conversa")
