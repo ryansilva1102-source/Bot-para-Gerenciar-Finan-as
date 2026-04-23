@@ -16,8 +16,8 @@ GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ["GEMINI_API_KEY"
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-2.5-flash"
-MODEL_FALLBACK = "gemini-2.5-flash-lite"
+MODEL_NAME = "gemini-2.5-flash-lite"
+MODEL_FALLBACK = "gemini-2.5-flash"
 
 
 def chamar_ia(contents, system_instruction):
