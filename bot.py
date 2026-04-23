@@ -1003,21 +1003,20 @@ def gerar_relatorio(message):
         (user_id, mes, hoje_str)
     ).fetchone()[0] or 0.0
 
-    # 3. Gastos Fixos que ainda vão cair este mês (dia_mes >= hoje e ainda não aplicados neste mês)
+    # 3. Gastos Fixos que ainda não caíram este mês (Pendentes)
     gastos_fixos_futuros = conn.execute(
         """SELECT SUM(valor) FROM gastos_fixos 
-           WHERE user_id = ? AND dia_mes >= ? 
+           WHERE user_id = ? 
            AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
-        (user_id, dia_atual, mes)
+        (user_id, mes)
     ).fetchone()[0] or 0.0
 
-    # 4. Parcelamentos que ainda vão cair este mês
+    # 4. Parcelamentos que ainda não caíram este mês (Pendentes)
     parcelas_futuras = conn.execute(
         """SELECT SUM(valor_parcela) FROM parcelamentos 
-           WHERE user_id = ? AND dia_cobranca >= ? 
-           AND parcelas_pagas < total_parcelas 
+           WHERE user_id = ? AND parcelas_pagas < total_parcelas 
            AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
-        (user_id, dia_atual, mes)
+        (user_id, mes)
     ).fetchone()[0] or 0.0
 
     gastos_futuros = gastos_futuros_pontuais + gastos_fixos_futuros + parcelas_futuras
@@ -1584,25 +1583,24 @@ def processar_mensagem(message):
                 (user_id, mes, hoje_str)
             ).fetchall()
 
-            # 2. Busca gastos fixos que ainda vão cair
+           # 2. Busca gastos fixos pendentes no mês
             fixos = conn.execute(
                 """SELECT dia_mes, valor, descricao FROM gastos_fixos
-                   WHERE user_id = ? AND dia_mes >= ?
+                   WHERE user_id = ? 
                    AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)
                    ORDER BY dia_mes""",
-                (user_id, dia_atual, mes)
+                (user_id, mes)
             ).fetchall()
 
-            # 3. Busca parcelamentos que ainda vão cair
+            # 3. Busca parcelamentos pendentes no mês
             parcelas = conn.execute(
                 """SELECT dia_cobranca, valor_parcela, descricao, parcelas_pagas, total_parcelas
                    FROM parcelamentos
-                   WHERE user_id = ? AND dia_cobranca >= ? AND parcelas_pagas < total_parcelas
+                   WHERE user_id = ? AND parcelas_pagas < total_parcelas
                    AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)
                    ORDER BY dia_cobranca""",
-                (user_id, dia_atual, mes)
+                (user_id, mes)
             ).fetchall()
-            conn.close()
 
             if not pontuais and not fixos and not parcelas:
                 bot.reply_to(message, "Você não tem nenhum gasto futuro, fixo ou parcela pendente para o resto deste mês! 🎉")
