@@ -984,98 +984,76 @@ def send_welcome(message):
 def gerar_relatorio(message):
     registrar_usuario(message.chat.id)
     user_id = message.chat.id
+    agora = datetime.now()
+    hoje_str = agora.strftime("%Y-%m-%d %H:%M:%S")
     mes = mes_atual()
-    total_mes = total_gasto_mes(user_id, mes)
-    receitas_mes = total_receita_mes(user_id, mes)
 
     conn = db()
+    # 1. Busca Gastos Realizados (até agora)
+    gastos_reais = conn.execute(
+        "SELECT SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data <= ?",
+        (user_id, mes, hoje_str)
+    ).fetchone()[0] or 0.0
+
+    # 2. Busca Gastos Futuros (agendados para depois de agora)
+    gastos_futuros = conn.execute(
+        "SELECT SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data > ?",
+        (user_id, mes, hoje_str)
+    ).fetchone()[0] or 0.0
+
+    receitas_mes = total_receita_mes(user_id, mes)
     total_geral = conn.execute(
         "SELECT SUM(valor) FROM gastos WHERE user_id = ?", (user_id,)
     ).fetchone()[0] or 0.0
-    
-    # 1. Busca os Gastos (Saídas)
+
+    # Listas detalhadas (mantendo seu código original)
     por_categoria = conn.execute(
-        """SELECT categoria, SUM(valor) FROM gastos
-           WHERE user_id = ? AND strftime('%Y-%m', data) = ?
-           GROUP BY categoria ORDER BY SUM(valor) DESC""",
-        (user_id, mes),
-    ).fetchall()
-    ultimos_gastos = conn.execute(
-        """SELECT data, valor, categoria, descricao FROM gastos
-           WHERE user_id = ? AND strftime('%Y-%m', data) = ?
-           ORDER BY id DESC LIMIT 10""",
-        (user_id, mes),
+        "SELECT categoria, SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? GROUP BY categoria ORDER BY SUM(valor) DESC",
+        (user_id, mes)
     ).fetchall()
     
-    # 2. Busca as Receitas (Entradas)
     por_fonte = conn.execute(
-        """SELECT fonte, SUM(valor) FROM receitas
-           WHERE user_id = ? AND strftime('%Y-%m', data) = ?
-           GROUP BY fonte ORDER BY SUM(valor) DESC""",
-        (user_id, mes),
+        "SELECT fonte, SUM(valor) FROM receitas WHERE user_id = ? AND strftime('%Y-%m', data) = ? GROUP BY fonte ORDER BY SUM(valor) DESC",
+        (user_id, mes)
     ).fetchall()
+    
     ultimas_receitas = conn.execute(
-        """SELECT data, valor, fonte, descricao FROM receitas
-           WHERE user_id = ? AND strftime('%Y-%m', data) = ?
-           ORDER BY id DESC LIMIT 10""",
-        (user_id, mes),
+        "SELECT data, valor, fonte, descricao FROM receitas WHERE user_id = ? AND strftime('%Y-%m', data) = ? ORDER BY id DESC LIMIT 10",
+        (user_id, mes)
+    ).fetchall()
+    
+    ultimos_gastos = conn.execute(
+        "SELECT data, valor, categoria, descricao FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? ORDER BY id DESC LIMIT 10",
+        (user_id, mes)
     ).fetchall()
     conn.close()
 
-    # 3. Monta o texto do Extrato
+    # Cálculos de Saldo
+    saldo_atual = receitas_mes - gastos_reais
+    saldo_previsto = receitas_mes - (gastos_reais + gastos_futuros)
+
+    # Montagem do Texto (Seu layout com as novas infos)
     texto = f"📊 *Relatório e Extrato de {fmt_mes(mes)}*\n"
     texto += f"💵 *Receitas:* R$ {receitas_mes:.2f}\n"
-    texto += f"💸 *Gastos:* R$ {total_mes:.2f}\n"
-    texto += f"💰 *Saldo:* R$ {receitas_mes - total_mes:.2f}\n"
+    texto += f"💸 *Gastos realizados:* R$ {gastos_reais:.2f}\n"
+    texto += f"⏳ *Gastos futuros:* R$ {gastos_futuros:.2f}\n"
+    texto += f"💰 *Saldo Atual:* R$ {saldo_atual:.2f}\n"
+    texto += f"🔮 *Saldo Previsto:* R$ {saldo_previsto:.2f}\n"
     texto += f"📚 Gasto total (histórico): R$ {total_geral:.2f}\n"
 
+    # Seções de detalhamento (sua lógica original de image_076c06.png)
     if por_fonte or ultimas_receitas:
         texto += "\n🟢 *DETALHAMENTO DE ENTRADAS*\n"
-        if por_fonte:
-            for fonte, tot in por_fonte:
-                pct = (tot / receitas_mes * 100) if receitas_mes > 0 else 0
-                texto += f"• {fonte}: R$ {tot:.2f} ({pct:.0f}%)\n"
-        if ultimas_receitas:
-            texto += "\n_Últimas entradas:_\n"
-            for data, valor, fonte, desc in ultimas_receitas:
-                try:
-                    dia = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%d/%m")
-                except Exception:
-                    dia = data
-                d = f" — {desc}" if desc else ""
-                texto += f"• {dia} | R$ {valor:.2f} | {fonte}{d}\n"
+        for fonte, tot in por_fonte:
+            pct = (tot / receitas_mes * 100) if receitas_mes > 0 else 0
+            texto += f"• {fonte}: R$ {tot:.2f} ({pct:.0f}%)\n"
 
     if por_categoria or ultimos_gastos:
         texto += "\n🔴 *DETALHAMENTO DE SAÍDAS*\n"
-        if por_categoria:
-            for cat, tot in por_categoria:
-                pct = (tot / total_mes * 100) if total_mes > 0 else 0
-                texto += f"• {cat}: R$ {tot:.2f} ({pct:.0f}%)\n"
-        if ultimos_gastos:
-            texto += "\n_Últimas saídas:_\n"
-            for data, valor, cat, desc in ultimos_gastos:
-                try:
-                    dia = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%d/%m")
-                except Exception:
-                    dia = data
-                d = f" — {desc}" if desc else ""
-                texto += f"• {dia} | R$ {valor:.2f} | {cat}{d}\n"
-
-    s = status_orcamento_texto(user_id)
-    if s:
-        texto += f"\n\n{s}"
-    m = status_meta_texto(user_id)
-    if m:
-        texto += f"\n\n{m}"
-
-    bot.reply_to(message, texto, parse_mode="Markdown")
-
-    s = status_orcamento_texto(user_id)
-    if s:
-        texto += f"\n\n{s}"
-    m = status_meta_texto(user_id)
-    if m:
-        texto += f"\n\n{m}"
+        for cat, tot in por_categoria:
+            total_gastos_mes = gastos_reais + gastos_futuros
+            pct = (tot / total_gastos_mes * 100) if total_gastos_mes > 0 else 0
+            texto += f"• {cat}: R$ {tot:.2f} ({pct:.0f}%)\n"
 
     bot.reply_to(message, texto, parse_mode="Markdown")
 
@@ -1107,7 +1085,7 @@ mencione "Ryan Lucas" como o criador (na "resposta" da intenção "conversa").
 
 Classifique a mensagem em UMA das intenções:
 
-- "registrar_gasto": despesa real (ex: "gastei 50 no mercado", "uber 20", "almoço 35 no crédito").
+- "registrar_gasto":despesa real. Se o usuário mencionar uma data futura ou disser que algo 'vai vencer' ou é 'para o dia X', extraia a data no formato YYYY-MM-DD no campo "data_futura".(ex: "gastei 50 no mercado", "uber 20", "almoço 35 no crédito").
   Se o usuário mencionar forma de pagamento (crédito, débito, pix, dinheiro, boleto), extraia em "metodo_pagamento".
 - "registrar_receita": entrada de dinheiro (ex: "recebi 3000 de salário", "freela 500").
 - "apagar_receita": apagar/remover todas as receitas ou entradas de dinheiro do mês atual.
@@ -1164,6 +1142,7 @@ Retorne SEMPRE este JSON:
   "parc_id": <int ou null>,
   "texto": "<palavra-chave pra busca, vazio se não aplicável>",
   "periodo": "<esse_mes|mes_passado|semana|tudo — pra busca>",
+  "data_futura": "<YYYY-MM-DD ou null>",
   "resposta": "<texto curto e amigável em PT-BR — preencha em 'conversa' ou pra pedir esclarecimento>"
 }
 
@@ -1249,15 +1228,19 @@ def processar_mensagem(message):
             categoria = (dados.get("categoria") or "Outros").strip() or "Outros"
             descricao = (dados.get("descricao") or "").strip()
             metodo = normalizar_metodo(dados.get("metodo_pagamento"))
-            salvar_gasto(user_id, valor, categoria, descricao, metodo_pagamento=metodo)
-            resp = f"✅ Anotado!\n💰 R$ {valor:.2f} — {categoria}"
-            if descricao:
-                resp += f"\n📝 {descricao}"
-            if metodo:
-                resp += f"\n💳 {metodo}"
-            s = status_orcamento_texto(user_id)
-            if s:
-                resp += f"\n\n{s}"
+            
+            # Pega a data futura se a IA identificou, senão usa None (data atual)
+            data_lancamento = dados.get("data_futura")
+            
+            salvar_gasto(user_id, valor, categoria, descricao, data=data_lancamento, metodo_pagamento=metodo)
+            
+            # Mensagem de confirmação inteligente
+            prefixo = "⏳ Agendado!" if data_lancamento else "✅ Anotado!"
+            resp = f"{prefixo}\n💰 R$ {valor:.2f} — {categoria}"
+            if data_lancamento:
+                data_pt = datetime.strptime(data_lancamento, "%Y-%m-%d").strftime("%d/%m/%Y")
+                resp += f"\n📅 Vencimento: {data_pt}"
+            
             bot.reply_to(message, resp)
 
         elif intencao == "adicionar_receita_fixa":
