@@ -1264,11 +1264,14 @@ Classifique a mensagem em UMA das intenções:
 - "remover_receita_fixa": remover receita fixa (extraia "fixo_id" se mencionado).
 - "listar_gastos_futuros": listar ou mostrar contas a pagar, gastos futuros, agendados, ou o que falta pagar neste mês.
 - "resumo_diario": usuário pede para ver entradas, saídas, gastos ou receitas de um dia específico
-  (ex: "meus gastos de hoje", "o que entrou hoje", "extrato de ontem", "gastos do dia 15", "movimentações de hoje", "quanto gastei hoje?").
+  (ex: "meus gastos de hoje", "o que entrou hoje", "extrato de ontem", "gastos do dia 15", "movimentações de hoje", "quanto gastei hoje?", "meu relatório de hoje").
   Em "tipo_dia" coloque "gastos" se pedir só saídas/gastos, "receitas" se pedir só entradas/receitas,
-  ou "ambos" se pedir extrato/movimentação/resumo do dia inteiro.
-  Em "data_futura" coloque a data no formato YYYY-MM-DD se o usuário mencionar dia específico
-  (use a data de HOJE se ele disser "hoje" ou não mencionar dia, e a data de ONTEM se disser "ontem").
+  ou "ambos" se pedir extrato/relatório/movimentação/resumo do dia inteiro.
+  Em "dia_relativo" coloque "hoje", "ontem" ou "outro" — NUNCA invente datas absolutas.
+  Em "data_futura" SÓ preencha (formato YYYY-MM-DD) se o usuário mencionar uma data ESPECÍFICA E COMPLETA
+  (ex: "15/04/2026"). Se ele só falar "dia 15" sem ano, deixe "data_futura" como null e coloque
+  o número do dia em "dia_mes". Para "hoje" ou "ontem", deixe "data_futura" como null — o sistema
+  resolve a data sozinho.
 
 Retorne SEMPRE este JSON:
 {
@@ -1285,6 +1288,7 @@ Retorne SEMPRE este JSON:
   "texto": "<palavra-chave pra busca, vazio se não aplicável>",
   "periodo": "<esse_mes|mes_passado|semana|tudo — pra busca>",
   "tipo_dia": "<gastos|receitas|ambos ou vazio — pra resumo_diario>",
+  "dia_relativo": "<hoje|ontem|outro ou vazio — pra resumo_diario>",
   "data_futura": "<YYYY-MM-DD ou null>",
   "resposta": "<texto curto e amigável em PT-BR — preencha em 'conversa' ou pra pedir esclarecimento>"
 }
@@ -1733,7 +1737,38 @@ def processar_mensagem(message):
             tipo_dia = (dados.get("tipo_dia") or "ambos").strip().lower()
             if tipo_dia not in ("gastos", "receitas", "ambos"):
                 tipo_dia = "ambos"
-            dia = (dados.get("data_futura") or "").strip() or None
+
+            dia_relativo = (dados.get("dia_relativo") or "").strip().lower()
+            data_futura = (dados.get("data_futura") or "").strip() or None
+            dia_mes_num = dados.get("dia_mes")
+
+            # Resolve a data localmente — não confia em datas absolutas inventadas pela IA
+            if dia_relativo == "hoje" or (not dia_relativo and not data_futura and not dia_mes_num):
+                dia = datetime.now().strftime("%Y-%m-%d")
+            elif dia_relativo == "ontem":
+                dia = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            elif dia_mes_num:
+                # Usuário disse "dia 15" — assume mês/ano atual
+                try:
+                    d = int(dia_mes_num)
+                    hoje = datetime.now()
+                    dia = hoje.replace(day=d).strftime("%Y-%m-%d")
+                except (ValueError, TypeError):
+                    dia = datetime.now().strftime("%Y-%m-%d")
+            elif data_futura:
+                # Só aceita data absoluta se for do ano corrente ou anterior (sanity check)
+                try:
+                    dt = datetime.strptime(data_futura, "%Y-%m-%d")
+                    ano_atual = datetime.now().year
+                    if dt.year < ano_atual - 1 or dt.year > ano_atual + 1:
+                        dia = datetime.now().strftime("%Y-%m-%d")
+                    else:
+                        dia = data_futura
+                except ValueError:
+                    dia = datetime.now().strftime("%Y-%m-%d")
+            else:
+                dia = datetime.now().strftime("%Y-%m-%d")
+
             bot.reply_to(
                 message,
                 resumo_diario_texto(user_id, dia=dia, tipo=tipo_dia),
