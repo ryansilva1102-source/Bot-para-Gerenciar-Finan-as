@@ -992,41 +992,83 @@ def gerar_relatorio(message):
     total_geral = conn.execute(
         "SELECT SUM(valor) FROM gastos WHERE user_id = ?", (user_id,)
     ).fetchone()[0] or 0.0
+    
+    # 1. Busca os Gastos (Saídas)
     por_categoria = conn.execute(
         """SELECT categoria, SUM(valor) FROM gastos
            WHERE user_id = ? AND strftime('%Y-%m', data) = ?
            GROUP BY categoria ORDER BY SUM(valor) DESC""",
         (user_id, mes),
     ).fetchall()
-    ultimos = conn.execute(
+    ultimos_gastos = conn.execute(
         """SELECT data, valor, categoria, descricao FROM gastos
+           WHERE user_id = ? AND strftime('%Y-%m', data) = ?
+           ORDER BY id DESC LIMIT 10""",
+        (user_id, mes),
+    ).fetchall()
+    
+    # 2. Busca as Receitas (Entradas)
+    por_fonte = conn.execute(
+        """SELECT fonte, SUM(valor) FROM receitas
+           WHERE user_id = ? AND strftime('%Y-%m', data) = ?
+           GROUP BY fonte ORDER BY SUM(valor) DESC""",
+        (user_id, mes),
+    ).fetchall()
+    ultimas_receitas = conn.execute(
+        """SELECT data, valor, fonte, descricao FROM receitas
            WHERE user_id = ? AND strftime('%Y-%m', data) = ?
            ORDER BY id DESC LIMIT 10""",
         (user_id, mes),
     ).fetchall()
     conn.close()
 
-    texto = f"📊 *Relatório de {fmt_mes(mes)}*\n"
-    texto += f"💵 Receitas: R$ {receitas_mes:.2f}\n"
-    texto += f"💸 Gastos: R$ {total_mes:.2f}\n"
-    texto += f"💰 Saldo: R$ {receitas_mes - total_mes:.2f}\n"
-    texto += f"📚 Gasto total (histórico): R$ {total_geral:.2f}"
+    # 3. Monta o texto do Extrato
+    texto = f"📊 *Relatório e Extrato de {fmt_mes(mes)}*\n"
+    texto += f"💵 *Receitas:* R$ {receitas_mes:.2f}\n"
+    texto += f"💸 *Gastos:* R$ {total_mes:.2f}\n"
+    texto += f"💰 *Saldo:* R$ {receitas_mes - total_mes:.2f}\n"
+    texto += f"📚 Gasto total (histórico): R$ {total_geral:.2f}\n"
 
-    if por_categoria:
-        texto += "\n\n*Por categoria:*"
-        for cat, tot in por_categoria:
-            pct = (tot / total_mes * 100) if total_mes > 0 else 0
-            texto += f"\n• {cat}: R$ {tot:.2f} ({pct:.0f}%)"
+    if por_fonte or ultimas_receitas:
+        texto += "\n🟢 *DETALHAMENTO DE ENTRADAS*\n"
+        if por_fonte:
+            for fonte, tot in por_fonte:
+                pct = (tot / receitas_mes * 100) if receitas_mes > 0 else 0
+                texto += f"• {fonte}: R$ {tot:.2f} ({pct:.0f}%)\n"
+        if ultimas_receitas:
+            texto += "\n_Últimas entradas:_\n"
+            for data, valor, fonte, desc in ultimas_receitas:
+                try:
+                    dia = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%d/%m")
+                except Exception:
+                    dia = data
+                d = f" — {desc}" if desc else ""
+                texto += f"• {dia} | R$ {valor:.2f} | {fonte}{d}\n"
 
-    if ultimos:
-        texto += "\n\n*Últimos lançamentos:*"
-        for data, valor, cat, desc in ultimos:
-            try:
-                dia = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%d/%m")
-            except Exception:
-                dia = data
-            d = f" — {desc}" if desc else ""
-            texto += f"\n• {dia} | R$ {valor:.2f} | {cat}{d}"
+    if por_categoria or ultimos_gastos:
+        texto += "\n🔴 *DETALHAMENTO DE SAÍDAS*\n"
+        if por_categoria:
+            for cat, tot in por_categoria:
+                pct = (tot / total_mes * 100) if total_mes > 0 else 0
+                texto += f"• {cat}: R$ {tot:.2f} ({pct:.0f}%)\n"
+        if ultimos_gastos:
+            texto += "\n_Últimas saídas:_\n"
+            for data, valor, cat, desc in ultimos_gastos:
+                try:
+                    dia = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%d/%m")
+                except Exception:
+                    dia = data
+                d = f" — {desc}" if desc else ""
+                texto += f"• {dia} | R$ {valor:.2f} | {cat}{d}\n"
+
+    s = status_orcamento_texto(user_id)
+    if s:
+        texto += f"\n\n{s}"
+    m = status_meta_texto(user_id)
+    if m:
+        texto += f"\n\n{m}"
+
+    bot.reply_to(message, texto, parse_mode="Markdown")
 
     s = status_orcamento_texto(user_id)
     if s:
@@ -1086,7 +1128,7 @@ Classifique a mensagem em UMA das intenções:
   Em "dia_mes" o dia de cobrança da fatura (assuma dia 10 se não mencionado).
 - "listar_parcelamentos": ver compras parceladas em andamento.
 - "remover_parcelamento": cancelar parcelamento (extraia "parc_id").
-- "consultar_relatorio": ver gastos, total, categorias, histórico.
+- "consultar_relatorio": ver extrato, entradas e saídas, detalhamento de receitas e gastos, categorias, histórico e relatório.
 - "comparar_meses": comparar mês atual com o anterior.
 - "resumo_semanal": ver resumo da semana.
 - "apagar_ultimo": apagar/desfazer o último gasto registrado.
