@@ -88,6 +88,17 @@ def criar_banco():
         )
     """)
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS receitas_fixas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 0,
+            descricao TEXT,
+            valor REAL,
+            fonte TEXT,
+            dia_mes INTEGER,
+            ultimo_mes_aplicado TEXT
+        )
+    """)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS receitas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL DEFAULT 0,
@@ -271,6 +282,58 @@ def apagar_ultimo_gasto(user_id):
 
 # ================= RECEITAS =================
 
+def adicionar_receita_fixa(user_id, descricao, valor, fonte, dia_mes):
+    conn = db()
+    conn.execute(
+        """INSERT INTO receitas_fixas (user_id, descricao, valor, fonte, dia_mes, ultimo_mes_aplicado)
+           VALUES (?, ?, ?, ?, ?, NULL)""",
+        (user_id, descricao, valor, fonte, dia_mes),
+    )
+    conn.commit()
+    conn.close()
+
+def listar_receitas_fixas(user_id):
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, descricao, valor, fonte, dia_mes FROM receitas_fixas WHERE user_id = ? ORDER BY dia_mes",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+def remover_receita_fixa(user_id, fixo_id):
+    conn = db()
+    n = conn.execute(
+        "DELETE FROM receitas_fixas WHERE id = ? AND user_id = ?", (fixo_id, user_id)
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+def aplicar_receitas_fixas_do_dia():
+    hoje = datetime.now()
+    dia = hoje.day
+    mes = hoje.strftime("%Y-%m")
+    conn = db()
+    rows = conn.execute(
+        """SELECT id, user_id, descricao, valor, fonte FROM receitas_fixas
+           WHERE dia_mes = ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+        (dia, mes),
+    ).fetchall()
+    aplicados = 0
+    for fid, user_id, desc, valor, fonte in rows:
+        conn.execute(
+            "INSERT INTO receitas (user_id, data, valor, fonte, descricao) VALUES (?, ?, ?, ?, ?)",
+            (user_id, hoje.strftime("%Y-%m-%d %H:%M:%S"), valor, fonte, desc),
+        )
+        conn.execute(
+            "UPDATE receitas_fixas SET ultimo_mes_aplicado = ? WHERE id = ?", (mes, fid)
+        )
+        aplicados += 1
+    conn.commit()
+    conn.close()
+    if aplicados:
+        print(f"Aplicadas {aplicados} receitas fixas hoje ({hoje.date()})")
 def salvar_receita(user_id, valor, fonte, descricao):
     conn = db()
     conn.execute(
@@ -1035,6 +1098,9 @@ Classifique a mensagem em UMA das intenções:
 - "ativar_lembrete": usuário quer ativar/ligar lembretes diários.
 - "desativar_lembrete": usuário quer desativar/desligar/parar lembretes diários.
 - "conversa": qualquer outra coisa (saudação, dúvida, agradecimento).
+- "adicionar_receita_fixa": cadastrar entrada de dinheiro automática (ex: "recebo 828 de salário todo dia 15", "adiantamento 500 dia 20"). Extraia o "dia_mes".
+- "listar_receitas_fixas": ver receitas fixas cadastradas.
+- "remover_receita_fixa": remover uma receita fixa (extraia o ID em "fixo_id" se mencionado).
 
 Retorne SEMPRE este JSON:
 {
@@ -1146,6 +1212,45 @@ def processar_mensagem(message):
                 resp += f"\n\n{s}"
             bot.reply_to(message, resp)
 
+        elif intencao == "adicionar_receita_fixa":
+            valor = parse_valor(dados.get("valor"))
+            dia = dados.get("dia_mes")
+            descricao = (dados.get("descricao") or "Receita Fixa").strip()
+            fonte = (dados.get("fonte") or dados.get("categoria") or "Salário").strip()
+            if valor <= 0 or not dia:
+                bot.reply_to(message, "Para cadastrar uma receita fixa preciso do valor e do dia do mês. Ex: 'recebo 828 todo dia 15'.")
+                return
+            try:
+                dia = int(dia)
+                if dia < 1 or dia > 31:
+                    raise ValueError
+            except (ValueError, TypeError):
+                bot.reply_to(message, "Dia do mês inválido (precisa ser entre 1 e 31).")
+                return
+            adicionar_receita_fixa(user_id, descricao, valor, fonte, dia)
+            bot.reply_to(
+                message,
+                f"💸 Receita automática programada!\n• {descricao} — R$ {valor:.2f} ({fonte})\n• Vai cair na conta todo dia {dia:02d}.",
+            )
+
+        elif intencao == "listar_receitas_fixas":
+            fixas = listar_receitas_fixas(user_id)
+            if not fixas:
+                bot.reply_to(message, "Você não tem receitas fixas programadas.")
+            else:
+                texto = "💵 *Suas receitas automáticas:*\n"
+                for fid, desc, valor, fonte, dia in fixas:
+                    texto += f"\n• #{fid} | dia {dia:02d} | R$ {valor:.2f} | {fonte} — {desc}"
+                texto += "\n\nPra remover: 'remove receita fixa #ID'"
+                bot.reply_to(message, texto, parse_mode="Markdown")
+
+        elif intencao == "remover_receita_fixa":
+            fid = dados.get("fixo_id")
+            if not fid:
+                bot.reply_to(message, "Qual receita fixa? Diga 'listar receitas fixas' pra ver os IDs.")
+                return
+            n = remover_receita_fixa(user_id, int(fid))
+            bot.reply_to(message, f"🗑️ Receita automática #{fid} removida." if n else f"Não encontrei a receita #{fid}.")
         elif intencao == "registrar_receita":
             valor = parse_valor(dados.get("valor"))
             if valor <= 0:
@@ -1385,6 +1490,7 @@ def processar_mensagem(message):
 def scheduler_loop():
     schedule.every().sunday.at("18:00").do(enviar_resumos_semanais)
     schedule.every().day.at("00:05").do(aplicar_gastos_fixos_do_dia)
+    schedule.every().day.at("00:05").do(aplicar_receitas_fixas_do_dia)
     schedule.every().day.at("00:10").do(aplicar_parcelamentos_do_dia)
     schedule.every().day.at("20:00").do(enviar_lembretes_diarios)
     while True:
@@ -1401,6 +1507,7 @@ if __name__ == "__main__":
     criar_banco()
     aplicar_gastos_fixos_do_dia()
     aplicar_parcelamentos_do_dia()
+    aplicar_receitas_fixas_do_dia()
     threading.Thread(target=scheduler_loop, daemon=True).start()
     print("🤖 Bot rodando (multi-usuário)...")
     bot.infinity_polling()
