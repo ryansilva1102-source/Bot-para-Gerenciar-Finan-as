@@ -1166,6 +1166,7 @@ Classifique a mensagem em UMA das intenções:
 - "adicionar_receita_fixa": entrada de dinheiro automática mensal (ex: "recebo 828 todo dia 15"). Extraia o "dia_mes".
 - "listar_receitas_fixas": ver receitas fixas cadastradas.
 - "remover_receita_fixa": remover receita fixa (extraia "fixo_id" se mencionado).
+- "listar_gastos_futuros": listar ou mostrar contas a pagar, gastos futuros, agendados, ou o que falta pagar neste mês.
 
 Retorne SEMPRE este JSON:
 {
@@ -1570,6 +1571,62 @@ def processar_mensagem(message):
             definir_lembrete(user_id, True)
             bot.reply_to(message, "🔔 Lembretes diários ativados! Vou te lembrar todo dia às 20h se você esquecer de registrar gastos.")
 
+        elif intencao == "listar_gastos_futuros":
+            agora = datetime.now()
+            hoje_str = agora.strftime("%Y-%m-%d %H:%M:%S")
+            mes = mes_atual()
+            dia_atual = agora.day
+
+            conn = db()
+            # 1. Busca gastos pontuais futuros
+            pontuais = conn.execute(
+                "SELECT data, valor, descricao FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data > ?",
+                (user_id, mes, hoje_str)
+            ).fetchall()
+
+            # 2. Busca gastos fixos que ainda vão cair
+            fixos = conn.execute(
+                """SELECT dia_mes, valor, descricao FROM gastos_fixos
+                   WHERE user_id = ? AND dia_mes >= ?
+                   AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)
+                   ORDER BY dia_mes""",
+                (user_id, dia_atual, mes)
+            ).fetchall()
+
+            # 3. Busca parcelamentos que ainda vão cair
+            parcelas = conn.execute(
+                """SELECT dia_cobranca, valor_parcela, descricao, parcelas_pagas, total_parcelas
+                   FROM parcelamentos
+                   WHERE user_id = ? AND dia_cobranca >= ? AND parcelas_pagas < total_parcelas
+                   AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)
+                   ORDER BY dia_cobranca""",
+                (user_id, dia_atual, mes)
+            ).fetchall()
+            conn.close()
+
+            if not pontuais and not fixos and not parcelas:
+                bot.reply_to(message, "Você não tem nenhum gasto futuro, fixo ou parcela pendente para o resto deste mês! 🎉")
+            else:
+                texto = "⏳ *Suas Contas a Pagar (Restante do mês)*\n"
+                if pontuais:
+                    texto += "\n*Lançamentos Agendados:*\n"
+                    for d, v, desc in pontuais:
+                        try:
+                            dia_fmt = datetime.strptime(d, "%Y-%m-%d %H:%M:%S").strftime("%d/%m")
+                        except:
+                            dia_fmt = d
+                        texto += f"• {dia_fmt} | R$ {v:.2f} — {desc}\n"
+                if fixos:
+                    texto += "\n*Gastos Fixos:*\n"
+                    for d, v, desc in fixos:
+                        texto += f"• Dia {d:02d} | R$ {v:.2f} — {desc}\n"
+                if parcelas:
+                    texto += "\n*Parcelamentos:*\n"
+                    for d, v, desc, pagas, total in parcelas:
+                        texto += f"• Dia {d:02d} | R$ {v:.2f} — {desc} ({pagas+1}/{total})\n"
+
+                bot.reply_to(message, texto, parse_mode="Markdown")
+                
         elif intencao == "desativar_lembrete":
             definir_lembrete(user_id, False)
             bot.reply_to(message, "🔕 Lembretes diários desativados. Pode reativar a qualquer momento dizendo 'ativa lembrete'.")
