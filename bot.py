@@ -9,8 +9,8 @@ import schedule
 import telebot
 import google.generativeai as genai
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+TELEGRAM_TOKEN = os.environ["8262213190:AAGNZfXEUf7gg2tRm3T5JM97lnsrxIbBhGw"]
+GEMINI_API_KEY = os.environ["AIzaSyBP3vXJ6wTqrEyOHZM5q_o1JoPcH2y8XDE"]
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
