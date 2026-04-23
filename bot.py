@@ -133,6 +133,16 @@ def criar_banco():
         )
     """)
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS feedbacks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            nome TEXT,
+            mensagem TEXT NOT NULL,
+            criado_em TEXT NOT NULL,
+            lido INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS parcelamentos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -228,6 +238,65 @@ def listar_autorizados():
     ).fetchall()
     conn.close()
     return rows
+
+
+# ================= FEEDBACK =================
+
+def salvar_feedback(user_id, nome, mensagem):
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO feedbacks (user_id, nome, mensagem, criado_em) VALUES (?, ?, ?, ?)",
+        (user_id, nome or "", mensagem, datetime.now().isoformat()),
+    )
+    fb_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return fb_id
+
+
+def listar_feedbacks(apenas_nao_lidos=True, limite=20):
+    conn = db()
+    if apenas_nao_lidos:
+        rows = conn.execute(
+            "SELECT id, user_id, nome, mensagem, criado_em, lido FROM feedbacks "
+            "WHERE lido = 0 ORDER BY criado_em DESC LIMIT ?",
+            (limite,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, user_id, nome, mensagem, criado_em, lido FROM feedbacks "
+            "ORDER BY criado_em DESC LIMIT ?",
+            (limite,),
+        ).fetchall()
+    conn.close()
+    return rows
+
+
+def buscar_feedback(fb_id):
+    conn = db()
+    row = conn.execute(
+        "SELECT id, user_id, nome, mensagem, criado_em, lido FROM feedbacks WHERE id = ?",
+        (fb_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def marcar_feedback_lido(fb_id):
+    conn = db()
+    n = conn.execute(
+        "UPDATE feedbacks SET lido = 1 WHERE id = ?", (fb_id,)
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def contar_feedbacks_nao_lidos():
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) FROM feedbacks WHERE lido = 0").fetchone()[0]
+    conn.close()
+    return n
 
 
 def registrar_usuario(chat_id):
@@ -1115,6 +1184,163 @@ def cmd_listar_autorizados(message):
             linha += f" ({nome})"
         texto += linha
     bot.reply_to(message, texto, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["feedback"])
+def cmd_feedback(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        bot.reply_to(
+            message,
+            f"🔒 Esse bot é privado. Pra pedir acesso, mande seu ID (`{user_id}`) pro dono.",
+            parse_mode="Markdown",
+        )
+        return
+
+    partes = message.text.split(maxsplit=1)
+    if len(partes) < 2 or not partes[1].strip():
+        bot.reply_to(
+            message,
+            "💬 *Mande sua sugestão, crítica ou relato de bug assim:*\n"
+            "`/feedback aqui vai a sua mensagem`\n\n"
+            "Vou ler tudo e responder se fizer sentido. 🙏",
+            parse_mode="Markdown",
+        )
+        return
+
+    mensagem = partes[1].strip()
+    if len(mensagem) > 2000:
+        bot.reply_to(message, "Sua mensagem ficou muito longa (máx. 2000 caracteres). Resume um pouco?")
+        return
+
+    nome = (message.from_user.first_name or "").strip() if message.from_user else ""
+    if message.from_user and message.from_user.username:
+        nome = f"{nome} (@{message.from_user.username})".strip()
+
+    fb_id = salvar_feedback(user_id, nome, mensagem)
+    bot.reply_to(message, f"✅ Recebi seu feedback (#{fb_id}). Obrigado! 🙌")
+
+    # Notifica o admin no privado
+    try:
+        bot.send_message(
+            ADMIN_CHAT_ID,
+            f"📥 *Novo feedback #{fb_id}*\n"
+            f"👤 De: {nome or 'sem nome'} (`{user_id}`)\n"
+            f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+            f"{mensagem}\n\n"
+            f"_Responder:_ `/responder {fb_id} sua resposta aqui`",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"Erro ao notificar admin sobre feedback: {e}")
+
+
+@bot.message_handler(commands=["feedbacks"])
+def cmd_feedbacks(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    rows = listar_feedbacks(apenas_nao_lidos=True, limite=20)
+    if not rows:
+        bot.reply_to(message, "📭 Nenhum feedback novo.")
+        return
+    texto = f"📥 *Feedbacks não lidos ({len(rows)}):*\n"
+    for fb_id, uid, nome, msg, quando, _lido in rows:
+        try:
+            data_fmt = datetime.fromisoformat(quando).strftime("%d/%m %H:%M")
+        except Exception:
+            data_fmt = quando or "?"
+        preview = msg if len(msg) <= 200 else msg[:200] + "..."
+        texto += (
+            f"\n━━━━━━━━━━━━━━━━━━━\n"
+            f"*#{fb_id}* — {data_fmt}\n"
+            f"👤 {nome or 'sem nome'} (`{uid}`)\n"
+            f"{preview}\n"
+            f"_Marcar lido:_ `/lido {fb_id}` — _Responder:_ `/responder {fb_id} ...`"
+        )
+    # quebra em pedaços se passar de 4000 chars
+    while texto:
+        bot.send_message(ADMIN_CHAT_ID, texto[:4000], parse_mode="Markdown")
+        texto = texto[4000:]
+
+
+@bot.message_handler(commands=["feedbacks_todos"])
+def cmd_feedbacks_todos(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    rows = listar_feedbacks(apenas_nao_lidos=False, limite=20)
+    if not rows:
+        bot.reply_to(message, "📭 Nenhum feedback ainda.")
+        return
+    texto = f"📋 *Últimos {len(rows)} feedbacks (todos):*\n"
+    for fb_id, uid, nome, msg, quando, lido in rows:
+        try:
+            data_fmt = datetime.fromisoformat(quando).strftime("%d/%m %H:%M")
+        except Exception:
+            data_fmt = quando or "?"
+        marcador = "✅" if lido else "🆕"
+        preview = msg if len(msg) <= 150 else msg[:150] + "..."
+        texto += (
+            f"\n━━━━━━━━━━━━━━━━━━━\n"
+            f"{marcador} *#{fb_id}* — {data_fmt}\n"
+            f"👤 {nome or 'sem nome'} (`{uid}`)\n"
+            f"{preview}"
+        )
+    while texto:
+        bot.send_message(ADMIN_CHAT_ID, texto[:4000], parse_mode="Markdown")
+        texto = texto[4000:]
+
+
+@bot.message_handler(commands=["lido"])
+def cmd_lido(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    partes = message.text.split(maxsplit=1)
+    if len(partes) < 2:
+        bot.reply_to(message, "Uso: `/lido <id>`", parse_mode="Markdown")
+        return
+    try:
+        fb_id = int(partes[1])
+    except ValueError:
+        bot.reply_to(message, "ID inválido. Precisa ser um número.")
+        return
+    n = marcar_feedback_lido(fb_id)
+    if n:
+        bot.reply_to(message, f"✅ Feedback #{fb_id} marcado como lido.")
+    else:
+        bot.reply_to(message, f"Feedback #{fb_id} não encontrado.")
+
+
+@bot.message_handler(commands=["responder"])
+def cmd_responder(message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    partes = message.text.split(maxsplit=2)
+    if len(partes) < 3:
+        bot.reply_to(message, "Uso: `/responder <id> <mensagem>`", parse_mode="Markdown")
+        return
+    try:
+        fb_id = int(partes[1])
+    except ValueError:
+        bot.reply_to(message, "ID inválido. Precisa ser um número.")
+        return
+
+    fb = buscar_feedback(fb_id)
+    if not fb:
+        bot.reply_to(message, f"Feedback #{fb_id} não encontrado.")
+        return
+
+    _, dest_user_id, _, _, _, _ = fb
+    resposta = partes[2]
+    try:
+        bot.send_message(
+            dest_user_id,
+            f"💬 *Resposta do dono do bot ao seu feedback #{fb_id}:*\n\n{resposta}",
+            parse_mode="Markdown",
+        )
+        marcar_feedback_lido(fb_id)
+        bot.reply_to(message, f"✅ Resposta enviada pro usuário `{dest_user_id}` e feedback marcado como lido.", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Não consegui enviar a resposta: {e}")
 
 
 @bot.message_handler(commands=["meu_id"])
