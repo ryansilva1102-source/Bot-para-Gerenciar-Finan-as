@@ -1122,7 +1122,7 @@ def cmd_meu_id(message):
     """Comando público pra quem quer pedir acesso ao admin."""
     bot.reply_to(
         message,
-        f"Seu chat_id é: `{message.chat.id}`\n"
+        f"Seu ID é: `{message.chat.id}`\n"
         f"Mande esse número pro dono do bot pra pedir acesso.",
         parse_mode="Markdown",
     )
@@ -1424,8 +1424,7 @@ def processar_foto(message):
     if not usuario_autorizado(user_id):
         bot.reply_to(
             message,
-            "🔒 Esse bot é privado. Pra pedir acesso, mande seu chat_id "
-            f"(`{user_id}`) pro dono.",
+            f"🔒 Esse bot é privado. Pra pedir acesso, mande seu ID (`{user_id}`) pro dono.",
             parse_mode="Markdown",
         )
         return
@@ -1486,8 +1485,7 @@ def processar_mensagem(message):
     if not usuario_autorizado(user_id):
         bot.reply_to(
             message,
-            "🔒 Esse bot é privado. Pra pedir acesso, mande seu chat_id "
-            f"(`{user_id}`) pro dono.",
+            f"🔒 Esse bot é privado. Pra pedir acesso, mande seu ID (`{user_id}`) pro dono.",
             parse_mode="Markdown",
         )
         return
