@@ -143,6 +143,51 @@ def criar_banco():
         )
     """)
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cartoes_credito (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            nome TEXT NOT NULL,
+            limite REAL NOT NULL,
+            dia_fechamento INTEGER NOT NULL,
+            dia_vencimento INTEGER NOT NULL,
+            criado_em TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gastos_cartao (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            cartao_id INTEGER NOT NULL,
+            valor REAL NOT NULL,
+            categoria TEXT,
+            descricao TEXT,
+            data TEXT NOT NULL,
+            fatura_mes TEXT NOT NULL,
+            pago INTEGER NOT NULL DEFAULT 0,
+            pago_em TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS investimentos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            tipo TEXT NOT NULL,
+            nome TEXT NOT NULL,
+            valor REAL NOT NULL,
+            data TEXT NOT NULL,
+            ativo INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alertas_enviados (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            tipo TEXT NOT NULL,
+            referencia TEXT NOT NULL,
+            enviado_em TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS parcelamentos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -297,6 +342,452 @@ def contar_feedbacks_nao_lidos():
     n = conn.execute("SELECT COUNT(*) FROM feedbacks WHERE lido = 0").fetchone()[0]
     conn.close()
     return n
+
+
+# ================= CARTÕES DE CRÉDITO =================
+
+def criar_cartao(user_id, nome, limite, dia_fechamento, dia_vencimento):
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO cartoes_credito (user_id, nome, limite, dia_fechamento, dia_vencimento, criado_em) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, nome, limite, dia_fechamento, dia_vencimento, datetime.now().isoformat()),
+    )
+    cid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return cid
+
+
+def listar_cartoes(user_id):
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, nome, limite, dia_fechamento, dia_vencimento FROM cartoes_credito "
+        "WHERE user_id = ? ORDER BY nome",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def buscar_cartao(user_id, nome=None, cartao_id=None):
+    conn = db()
+    if cartao_id:
+        row = conn.execute(
+            "SELECT id, nome, limite, dia_fechamento, dia_vencimento FROM cartoes_credito "
+            "WHERE user_id = ? AND id = ?",
+            (user_id, cartao_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id, nome, limite, dia_fechamento, dia_vencimento FROM cartoes_credito "
+            "WHERE user_id = ? AND LOWER(nome) = LOWER(?)",
+            (user_id, nome),
+        ).fetchone()
+    conn.close()
+    return row
+
+
+def remover_cartao(user_id, cartao_id):
+    conn = db()
+    n = conn.execute(
+        "DELETE FROM cartoes_credito WHERE user_id = ? AND id = ?",
+        (user_id, cartao_id),
+    ).rowcount
+    if n:
+        conn.execute("DELETE FROM gastos_cartao WHERE user_id = ? AND cartao_id = ?", (user_id, cartao_id))
+    conn.commit()
+    conn.close()
+    return n
+
+
+def calcular_fatura_mes(data_compra, dia_fechamento):
+    """Retorna 'YYYY-MM' do mês de vencimento da fatura à qual essa compra pertence."""
+    if isinstance(data_compra, str):
+        data_compra = datetime.strptime(data_compra[:10], "%Y-%m-%d")
+    # Se a compra foi ATÉ o dia de fechamento, vai pra fatura que vence no PRÓXIMO mês
+    # Se foi DEPOIS, vai pra fatura do mês seguinte ao próximo
+    ano, mes, dia = data_compra.year, data_compra.month, data_compra.day
+    if dia <= dia_fechamento:
+        venc_mes = mes + 1
+        venc_ano = ano
+    else:
+        venc_mes = mes + 2
+        venc_ano = ano
+    if venc_mes > 12:
+        venc_mes -= 12
+        venc_ano += 1
+    return f"{venc_ano:04d}-{venc_mes:02d}"
+
+
+def registrar_gasto_cartao(user_id, cartao_id, valor, categoria, descricao, data=None):
+    conn = db()
+    data = data or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cartao = conn.execute(
+        "SELECT dia_fechamento FROM cartoes_credito WHERE id = ?", (cartao_id,)
+    ).fetchone()
+    if not cartao:
+        conn.close()
+        return None
+    fatura_mes = calcular_fatura_mes(data[:10], cartao[0])
+    cur = conn.execute(
+        "INSERT INTO gastos_cartao (user_id, cartao_id, valor, categoria, descricao, data, fatura_mes) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, cartao_id, valor, categoria, descricao, data, fatura_mes),
+    )
+    gid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return gid, fatura_mes
+
+
+def fatura_aberta(user_id, cartao_id, fatura_mes=None):
+    """Retorna lista de gastos da fatura aberta (não pagos) e o total."""
+    conn = db()
+    if fatura_mes:
+        rows = conn.execute(
+            "SELECT id, valor, categoria, descricao, data FROM gastos_cartao "
+            "WHERE user_id = ? AND cartao_id = ? AND fatura_mes = ? AND pago = 0 ORDER BY data",
+            (user_id, cartao_id, fatura_mes),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, valor, categoria, descricao, data FROM gastos_cartao "
+            "WHERE user_id = ? AND cartao_id = ? AND pago = 0 ORDER BY fatura_mes, data",
+            (user_id, cartao_id),
+        ).fetchall()
+    conn.close()
+    total = sum(r[1] for r in rows)
+    return rows, total
+
+
+def total_fatura_aberta_todos_cartoes(user_id):
+    """Soma o valor de todas as faturas em aberto de todos os cartões do usuário."""
+    conn = db()
+    total = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM gastos_cartao WHERE user_id = ? AND pago = 0",
+        (user_id,),
+    ).fetchone()[0]
+    conn.close()
+    return total or 0
+
+
+def pagar_fatura(user_id, cartao_id, fatura_mes=None):
+    """Marca todos os gastos da fatura como pagos e cria 1 gasto consolidado."""
+    rows, total = fatura_aberta(user_id, cartao_id, fatura_mes)
+    if not rows:
+        return 0, 0
+    cartao = buscar_cartao(user_id, cartao_id=cartao_id)
+    nome_cartao = cartao[1] if cartao else "Cartão"
+    conn = db()
+    agora = datetime.now().isoformat()
+    if fatura_mes:
+        conn.execute(
+            "UPDATE gastos_cartao SET pago = 1, pago_em = ? "
+            "WHERE user_id = ? AND cartao_id = ? AND fatura_mes = ? AND pago = 0",
+            (agora, user_id, cartao_id, fatura_mes),
+        )
+    else:
+        conn.execute(
+            "UPDATE gastos_cartao SET pago = 1, pago_em = ? "
+            "WHERE user_id = ? AND cartao_id = ? AND pago = 0",
+            (agora, user_id, cartao_id),
+        )
+    desc = f"Fatura {fatura_mes or 'aberta'} - {nome_cartao}"
+    conn.execute(
+        "INSERT INTO gastos (user_id, valor, categoria, descricao, data, metodo_pagamento) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, total, "Cartão de Crédito", desc, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Crédito"),
+    )
+    conn.commit()
+    conn.close()
+    return len(rows), total
+
+
+def percentual_limite_usado(user_id, cartao_id):
+    cartao = buscar_cartao(user_id, cartao_id=cartao_id)
+    if not cartao:
+        return 0, 0, 0
+    limite = cartao[2]
+    _, usado = fatura_aberta(user_id, cartao_id)
+    pct = (usado / limite * 100) if limite > 0 else 0
+    return usado, limite, pct
+
+
+def proxima_data_vencimento(dia_vencimento, hoje=None):
+    hoje = hoje or datetime.now().date()
+    try:
+        venc = hoje.replace(day=dia_vencimento)
+    except ValueError:
+        # dia inválido pro mês (ex: dia 31 em fevereiro) → último dia do mês
+        import calendar
+        ult = calendar.monthrange(hoje.year, hoje.month)[1]
+        venc = hoje.replace(day=min(dia_vencimento, ult))
+    if venc < hoje:
+        # já passou — próximo mês
+        mes = hoje.month + 1
+        ano = hoje.year
+        if mes > 12:
+            mes = 1
+            ano += 1
+        import calendar
+        ult = calendar.monthrange(ano, mes)[1]
+        venc = datetime(ano, mes, min(dia_vencimento, ult)).date()
+    return venc
+
+
+# ================= INVESTIMENTOS =================
+
+TIPOS_INVESTIMENTO = ["Reserva", "Renda Fixa", "Ações", "FIIs", "Cripto", "Outros"]
+
+
+def normalizar_tipo_investimento(t):
+    if not t:
+        return "Outros"
+    t = t.strip().lower()
+    mapa = {
+        "reserva": "Reserva", "reserva de emergência": "Reserva", "emergencia": "Reserva",
+        "emergência": "Reserva", "poupança": "Reserva", "poupanca": "Reserva",
+        "renda fixa": "Renda Fixa", "tesouro": "Renda Fixa", "cdb": "Renda Fixa",
+        "lci": "Renda Fixa", "lca": "Renda Fixa", "rf": "Renda Fixa",
+        "ações": "Ações", "acoes": "Ações", "ação": "Ações", "acao": "Ações",
+        "bolsa": "Ações", "fii": "FIIs", "fiis": "FIIs", "fundo imobiliário": "FIIs",
+        "fundo imobiliario": "FIIs", "imóveis": "FIIs",
+        "cripto": "Cripto", "criptomoeda": "Cripto", "bitcoin": "Cripto", "btc": "Cripto",
+    }
+    return mapa.get(t, "Outros")
+
+
+def registrar_investimento(user_id, tipo, nome, valor):
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO investimentos (user_id, tipo, nome, valor, data) VALUES (?, ?, ?, ?, ?)",
+        (user_id, normalizar_tipo_investimento(tipo), nome, valor, datetime.now().isoformat()),
+    )
+    iid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return iid
+
+
+def listar_investimentos(user_id):
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, tipo, nome, valor, data FROM investimentos "
+        "WHERE user_id = ? AND ativo = 1 ORDER BY tipo, nome",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def total_investimentos(user_id):
+    conn = db()
+    total = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM investimentos WHERE user_id = ? AND ativo = 1",
+        (user_id,),
+    ).fetchone()[0]
+    conn.close()
+    return total or 0
+
+
+def resgatar_investimento(user_id, nome, valor):
+    """Reduz o valor do investimento e adiciona como receita. Se zerar, marca inativo."""
+    conn = db()
+    row = conn.execute(
+        "SELECT id, valor FROM investimentos WHERE user_id = ? AND ativo = 1 "
+        "AND LOWER(nome) = LOWER(?) ORDER BY data DESC LIMIT 1",
+        (user_id, nome),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+    inv_id, atual = row
+    if valor >= atual:
+        valor = atual
+        conn.execute("UPDATE investimentos SET valor = 0, ativo = 0 WHERE id = ?", (inv_id,))
+    else:
+        conn.execute("UPDATE investimentos SET valor = valor - ? WHERE id = ?", (valor, inv_id))
+    # Volta o dinheiro como receita
+    conn.execute(
+        "INSERT INTO receitas (user_id, valor, fonte, descricao, data) VALUES (?, ?, ?, ?, ?)",
+        (user_id, valor, "Resgate", f"Resgate de {nome}", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+    return valor
+
+
+def patrimonio_texto(user_id):
+    """Saldo + investimentos - faturas abertas = patrimônio líquido."""
+    conn = db()
+    total_receitas = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM receitas WHERE user_id = ?", (user_id,)
+    ).fetchone()[0] or 0
+    total_gastos = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM gastos WHERE user_id = ?", (user_id,)
+    ).fetchone()[0] or 0
+    conn.close()
+    saldo = total_receitas - total_gastos
+    invest = total_investimentos(user_id)
+    fatura = total_fatura_aberta_todos_cartoes(user_id)
+    patrimonio = saldo + invest - fatura
+
+    invs = listar_investimentos(user_id)
+    por_tipo = {}
+    for _, tipo, _, valor, _ in invs:
+        por_tipo[tipo] = por_tipo.get(tipo, 0) + valor
+
+    texto = "💎 *Seu Patrimônio*\n\n"
+    texto += f"💰 Saldo em conta: R$ {saldo:.2f}\n"
+    texto += f"📈 Investimentos: R$ {invest:.2f}\n"
+    if fatura > 0:
+        texto += f"💳 Fatura aberta (cartão): -R$ {fatura:.2f}\n"
+    texto += f"\n🏆 *Patrimônio líquido: R$ {patrimonio:.2f}*\n"
+
+    if invs and invest > 0:
+        texto += "\n*Distribuição dos investimentos:*\n"
+        for tipo, val in sorted(por_tipo.items(), key=lambda x: -x[1]):
+            pct = val / invest * 100
+            texto += f"• {tipo}: R$ {val:.2f} ({pct:.0f}%)\n"
+    return texto
+
+
+def dica_investimento_texto(user_id):
+    """Gera dica educativa personalizada usando dados reais do usuário (sem recomendar ativos)."""
+    conn = db()
+    total_receitas = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM receitas WHERE user_id = ?", (user_id,)
+    ).fetchone()[0] or 0
+    total_gastos = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM gastos WHERE user_id = ?", (user_id,)
+    ).fetchone()[0] or 0
+    conn.close()
+    saldo = total_receitas - total_gastos
+    invest = total_investimentos(user_id)
+
+    # estimativa de gasto médio mensal
+    gasto_mensal = total_gasto_mes(user_id)
+    if gasto_mensal == 0:
+        gasto_mensal = total_gastos / 6 if total_gastos > 0 else 0
+
+    invs = listar_investimentos(user_id)
+    por_tipo = {}
+    for _, tipo, _, valor, _ in invs:
+        por_tipo[tipo] = por_tipo.get(tipo, 0) + valor
+    reserva = por_tipo.get("Reserva", 0)
+    reserva_ideal = gasto_mensal * 6
+
+    contexto = (
+        f"Dados financeiros do usuário (apenas para análise):\n"
+        f"- Saldo em conta: R$ {saldo:.2f}\n"
+        f"- Total investido: R$ {invest:.2f}\n"
+        f"- Reserva de emergência atual: R$ {reserva:.2f}\n"
+        f"- Reserva ideal (6 meses de gastos): R$ {reserva_ideal:.2f}\n"
+        f"- Gasto médio mensal: R$ {gasto_mensal:.2f}\n"
+        f"- Distribuição dos investimentos: {por_tipo if por_tipo else 'nenhum'}\n"
+    )
+    instr = (
+        "Você é um educador financeiro amigável. Com base nos dados acima, "
+        "dê 1 dica EDUCATIVA personalizada (máx 4 frases curtas) sobre investimentos. "
+        "REGRAS OBRIGATÓRIAS:\n"
+        "- NUNCA recomende ativos específicos (não diga 'compre PETR4', 'invista em Tesouro Selic', etc).\n"
+        "- Foque em conceitos: reserva de emergência, diversificação, perfil, prazo.\n"
+        "- Use português brasileiro coloquial, com 1-2 emojis.\n"
+        "- Se faltar reserva, priorize falar dela.\n"
+        "- Termine com uma pergunta motivadora ou próximo passo educativo."
+    )
+    try:
+        resposta = chamar_ia(user_id, contexto, instr)
+        return f"💡 *Dica de investimento*\n\n{resposta}"
+    except Exception as e:
+        print(f"Erro dica investimento: {e}")
+        return (
+            "💡 *Dica de investimento*\n\n"
+            f"Sua reserva ideal seria R$ {reserva_ideal:.2f} (6 meses de gastos). "
+            f"Hoje você tem R$ {reserva:.2f} guardado. "
+            "Antes de pensar em ações ou cripto, garante essa reserva — ela é o que te protege em emergências. 💪"
+        )
+
+
+# ================= ALERTAS (registro pra não duplicar) =================
+
+def alerta_ja_enviado(user_id, tipo, referencia):
+    conn = db()
+    row = conn.execute(
+        "SELECT 1 FROM alertas_enviados WHERE user_id = ? AND tipo = ? AND referencia = ?",
+        (user_id, tipo, referencia),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def marcar_alerta_enviado(user_id, tipo, referencia):
+    conn = db()
+    conn.execute(
+        "INSERT INTO alertas_enviados (user_id, tipo, referencia, enviado_em) VALUES (?, ?, ?, ?)",
+        (user_id, tipo, referencia, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def verificar_alertas_cartoes():
+    """Roda diariamente: alerta de fatura próxima do vencimento (3 dias antes)."""
+    conn = db()
+    cartoes = conn.execute(
+        "SELECT user_id, id, nome, dia_vencimento FROM cartoes_credito"
+    ).fetchall()
+    conn.close()
+    hoje = datetime.now().date()
+    for user_id, cid, nome, dia_venc in cartoes:
+        try:
+            venc = proxima_data_vencimento(dia_venc, hoje)
+            dias = (venc - hoje).days
+            if dias == 3:
+                _, total = fatura_aberta(user_id, cid)
+                if total <= 0:
+                    continue
+                ref = f"venc-{cid}-{venc.isoformat()}"
+                if alerta_ja_enviado(user_id, "vencimento_fatura", ref):
+                    continue
+                bot.send_message(
+                    user_id,
+                    f"⏰ *Lembrete de fatura*\n\n"
+                    f"💳 Cartão *{nome}* vence em 3 dias ({venc.strftime('%d/%m')})\n"
+                    f"💸 Valor: R$ {total:.2f}\n\n"
+                    f"_Quando pagar, manda:_ `/pagar_fatura {nome}`",
+                    parse_mode="Markdown",
+                )
+                marcar_alerta_enviado(user_id, "vencimento_fatura", ref)
+        except Exception as e:
+            print(f"Erro alerta vencimento {cid}: {e}")
+
+
+def verificar_alerta_limite(user_id, cartao_id):
+    """Chamado após cada gasto no cartão: alerta se passou de 70% do limite."""
+    try:
+        usado, limite, pct = percentual_limite_usado(user_id, cartao_id)
+        if pct < 70 or limite <= 0:
+            return
+        cartao = buscar_cartao(user_id, cartao_id=cartao_id)
+        if not cartao:
+            return
+        nome = cartao[1]
+        # Usa mês atual como referência pra não spammar (1 alerta por mês por cartão)
+        ref = f"limite70-{cartao_id}-{mes_atual()}"
+        if alerta_ja_enviado(user_id, "limite_cartao", ref):
+            return
+        bot.send_message(
+            user_id,
+            f"⚠️ *Atenção com o limite!*\n\n"
+            f"💳 Cartão *{nome}* já usou *{pct:.0f}%* do limite.\n"
+            f"💸 Usado: R$ {usado:.2f} de R$ {limite:.2f}",
+            parse_mode="Markdown",
+        )
+        marcar_alerta_enviado(user_id, "limite_cartao", ref)
+    except Exception as e:
+        print(f"Erro alerta limite: {e}")
 
 
 def registrar_usuario(chat_id):
@@ -1343,6 +1834,282 @@ def cmd_responder(message):
         bot.reply_to(message, f"❌ Não consegui enviar a resposta: {e}")
 
 
+@bot.message_handler(commands=["cartao_novo"])
+def cmd_cartao_novo(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split()
+    if len(partes) < 5:
+        bot.reply_to(
+            message,
+            "Uso: `/cartao_novo <nome> <limite> <dia_fechamento> <dia_vencimento>`\n"
+            "Exemplo: `/cartao_novo Nubank 5000 28 5`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        nome = partes[1]
+        limite = float(partes[2].replace(",", "."))
+        dia_fec = int(partes[3])
+        dia_venc = int(partes[4])
+        if not (1 <= dia_fec <= 31 and 1 <= dia_venc <= 31):
+            raise ValueError("dia inválido")
+    except ValueError:
+        bot.reply_to(message, "Valores inválidos. Limite tem que ser número e os dias entre 1 e 31.")
+        return
+    if buscar_cartao(user_id, nome=nome):
+        bot.reply_to(message, f"Você já tem um cartão chamado *{nome}*. Escolhe outro nome.", parse_mode="Markdown")
+        return
+    cid = criar_cartao(user_id, nome, limite, dia_fec, dia_venc)
+    bot.reply_to(
+        message,
+        f"✅ Cartão *{nome}* cadastrado!\n"
+        f"💳 Limite: R$ {limite:.2f}\n"
+        f"📅 Fecha dia {dia_fec}, vence dia {dia_venc}",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["cartoes"])
+def cmd_cartoes(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    cartoes = listar_cartoes(user_id)
+    if not cartoes:
+        bot.reply_to(
+            message,
+            "Você ainda não tem cartões cadastrados.\n"
+            "Cadastre com: `/cartao_novo Nubank 5000 28 5`",
+            parse_mode="Markdown",
+        )
+        return
+    texto = "💳 *Seus cartões:*\n"
+    for cid, nome, limite, dia_fec, dia_venc in cartoes:
+        usado, _, pct = percentual_limite_usado(user_id, cid)
+        disponivel = limite - usado
+        texto += (
+            f"\n━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ *{nome}* (id {cid})\n"
+            f"💰 Limite: R$ {limite:.2f} | Usado: R$ {usado:.2f} ({pct:.0f}%)\n"
+            f"✅ Disponível: R$ {disponivel:.2f}\n"
+            f"📅 Fecha dia {dia_fec} | Vence dia {dia_venc}"
+        )
+    bot.reply_to(message, texto, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["fatura"])
+def cmd_fatura(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=1)
+    cartoes = listar_cartoes(user_id)
+    if not cartoes:
+        bot.reply_to(message, "Você não tem cartões cadastrados ainda.")
+        return
+    if len(partes) < 2:
+        if len(cartoes) == 1:
+            cartao = cartoes[0]
+        else:
+            nomes = ", ".join(c[1] for c in cartoes)
+            bot.reply_to(message, f"Você tem mais de um cartão. Use: `/fatura <nome>`\nCartões: {nomes}", parse_mode="Markdown")
+            return
+    else:
+        nome = partes[1].strip()
+        cartao = buscar_cartao(user_id, nome=nome)
+        if not cartao:
+            bot.reply_to(message, f"Não achei cartão com nome *{nome}*.", parse_mode="Markdown")
+            return
+    cid, nome, limite, dia_fec, dia_venc = cartao
+    rows, total = fatura_aberta(user_id, cid)
+    if not rows:
+        bot.reply_to(message, f"💳 *{nome}*: nenhuma fatura aberta. ✨", parse_mode="Markdown")
+        return
+    venc = proxima_data_vencimento(dia_venc)
+    texto = (
+        f"💳 *Fatura {nome}*\n"
+        f"📅 Próximo vencimento: {venc.strftime('%d/%m/%Y')}\n"
+        f"💸 Total: *R$ {total:.2f}*\n\n"
+        f"*Lançamentos:*"
+    )
+    for gid, valor, cat, desc, data in rows[:25]:
+        try:
+            d = datetime.strptime(data[:10], "%Y-%m-%d").strftime("%d/%m")
+        except Exception:
+            d = data[:10]
+        cat = cat or "—"
+        desc = desc or ""
+        texto += f"\n• {d} | R$ {valor:.2f} | {cat}{(' — ' + desc) if desc else ''}"
+    if len(rows) > 25:
+        texto += f"\n_(+{len(rows) - 25} lançamentos)_"
+    texto += f"\n\n_Quando pagar:_ `/pagar_fatura {nome}`"
+    bot.reply_to(message, texto, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["pagar_fatura"])
+def cmd_pagar_fatura(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=1)
+    cartoes = listar_cartoes(user_id)
+    if not cartoes:
+        bot.reply_to(message, "Você não tem cartões cadastrados.")
+        return
+    if len(partes) < 2:
+        if len(cartoes) == 1:
+            cartao = cartoes[0]
+        else:
+            bot.reply_to(message, "Use: `/pagar_fatura <nome do cartão>`", parse_mode="Markdown")
+            return
+    else:
+        cartao = buscar_cartao(user_id, nome=partes[1].strip())
+        if not cartao:
+            bot.reply_to(message, f"Cartão *{partes[1]}* não encontrado.", parse_mode="Markdown")
+            return
+    cid, nome, *_ = cartao
+    n, total = pagar_fatura(user_id, cid)
+    if n == 0:
+        bot.reply_to(message, f"Não tinha fatura aberta no *{nome}*.", parse_mode="Markdown")
+        return
+    bot.reply_to(
+        message,
+        f"✅ Fatura do *{nome}* paga!\n"
+        f"💸 Total: R$ {total:.2f} ({n} lançamento(s))\n"
+        f"📊 Já lancei como gasto no seu saldo.",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["cartao_remover"])
+def cmd_cartao_remover(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=1)
+    if len(partes) < 2:
+        bot.reply_to(message, "Uso: `/cartao_remover <nome>`", parse_mode="Markdown")
+        return
+    cartao = buscar_cartao(user_id, nome=partes[1].strip())
+    if not cartao:
+        bot.reply_to(message, f"Cartão *{partes[1]}* não encontrado.", parse_mode="Markdown")
+        return
+    remover_cartao(user_id, cartao[0])
+    bot.reply_to(message, f"🗑️ Cartão *{cartao[1]}* removido (junto com os lançamentos dele).", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["investir"])
+def cmd_investir(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=3)
+    if len(partes) < 4:
+        bot.reply_to(
+            message,
+            "Uso: `/investir <valor> <tipo> <nome>`\n"
+            "Tipos: Reserva, Renda Fixa, Ações, FIIs, Cripto, Outros\n"
+            "Exemplo: `/investir 1000 Reserva Tesouro Selic`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        valor = float(partes[1].replace(",", "."))
+    except ValueError:
+        bot.reply_to(message, "Valor inválido.")
+        return
+    tipo = partes[2]
+    nome = partes[3]
+    iid = registrar_investimento(user_id, tipo, nome, valor)
+    bot.reply_to(
+        message,
+        f"📈 Investimento registrado (#{iid})\n"
+        f"💰 R$ {valor:.2f} em *{nome}* ({normalizar_tipo_investimento(tipo)})",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["investimentos"])
+def cmd_investimentos(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    invs = listar_investimentos(user_id)
+    if not invs:
+        bot.reply_to(
+            message,
+            "Você ainda não registrou investimentos.\n"
+            "Comece com: `/investir 1000 Reserva Tesouro Selic`",
+            parse_mode="Markdown",
+        )
+        return
+    total = total_investimentos(user_id)
+    por_tipo = {}
+    for _, tipo, _, valor, _ in invs:
+        por_tipo.setdefault(tipo, []).append(valor)
+    texto = f"📈 *Sua carteira:* R$ {total:.2f}\n"
+    for tipo, vals in sorted(por_tipo.items()):
+        soma = sum(vals)
+        pct = soma / total * 100 if total > 0 else 0
+        texto += f"\n*{tipo}* — R$ {soma:.2f} ({pct:.0f}%)"
+    texto += "\n\n*Aportes registrados:*"
+    for iid, tipo, nome, valor, data in invs[:20]:
+        try:
+            d = datetime.fromisoformat(data).strftime("%d/%m/%y")
+        except Exception:
+            d = data[:10]
+        texto += f"\n• #{iid} {d} | R$ {valor:.2f} | {tipo} — {nome}"
+    if len(invs) > 20:
+        texto += f"\n_(+{len(invs) - 20} aportes)_"
+    bot.reply_to(message, texto, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["resgatar"])
+def cmd_resgatar(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=2)
+    if len(partes) < 3:
+        bot.reply_to(message, "Uso: `/resgatar <valor> <nome>`\nEx: `/resgatar 500 Tesouro Selic`", parse_mode="Markdown")
+        return
+    try:
+        valor = float(partes[1].replace(",", "."))
+    except ValueError:
+        bot.reply_to(message, "Valor inválido.")
+        return
+    nome = partes[2]
+    resgatado = resgatar_investimento(user_id, nome, valor)
+    if resgatado is None:
+        bot.reply_to(message, f"Não achei investimento ativo chamado *{nome}*.", parse_mode="Markdown")
+        return
+    bot.reply_to(
+        message,
+        f"💸 Resgatado: R$ {resgatado:.2f} de *{nome}*\n"
+        f"📥 Lancei como receita no seu saldo.",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["patrimonio"])
+def cmd_patrimonio(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    bot.reply_to(message, patrimonio_texto(user_id), parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["dica_investir"])
+def cmd_dica_investir(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    bot.send_chat_action(message.chat.id, "typing")
+    bot.reply_to(message, dica_investimento_texto(user_id), parse_mode="Markdown")
+
+
 @bot.message_handler(commands=["meu_id"])
 def cmd_meu_id(message):
     """Comando público pra quem quer pedir acesso ao admin."""
@@ -1402,22 +2169,47 @@ def send_welcome(message):
         "Olá! Eu sou o *Gerenciador Financeiro* 💰\n"
         "_Criado por Ryan Lucas._\n\n"
         "Seus dados são privados — só você vê seus próprios gastos, orçamento e metas.\n\n"
-        "Você pode falar comigo naturalmente:\n"
-        "• 'gastei 50 no mercado no crédito' (gasto + forma de pagamento)\n"
+        "💬 *Você pode falar comigo naturalmente:*\n"
+        "• 'gastei 50 no mercado no débito'\n"
+        "• 'gastei 80 no ifood no crédito Nubank' (vai pra fatura!)\n"
         "• 'comprei celular 1200 em 12x' (parcelamento)\n"
         "• 'recebi 3000 de salário'\n"
         "• 'meu orçamento é 2000'\n"
         "• 'quero economizar 500 esse mês' (meta)\n"
         "• 'aluguel 1200 todo dia 5' (gasto fixo)\n"
+        "• 'investi 1000 na reserva de emergência'\n"
+        "• 'qual meu patrimônio?'\n"
+        "• 'me dá uma dica de investimento'\n"
+        "• 'minha fatura do Nubank'\n"
+        "• 'paguei a fatura'\n"
         "• 'quanto gastei com uber?' (busca)\n"
         "• 'me dá um conselho' (análise IA)\n"
         "• 'compara com mês passado'\n"
         "• 'resumo da semana'\n"
-        "• 'apaga o último'\n"
-        "• 'desativa lembrete' (controla lembretes diários)\n\n"
-        "📸 *Manda uma foto de comprovante ou nota fiscal* que eu leio e registro o gasto pra você.\n\n"
-        "📅 Todo domingo às 18h te mando um resumo da semana automaticamente.\n"
-        "🔔 Todo dia às 20h te lembro de registrar gastos (se esqueceu)."
+        "• 'apaga o último'\n\n"
+        "💳 *Cartão de crédito (comandos):*\n"
+        "• /cartao\\_novo `<nome> <limite> <fec> <venc>` — cadastra cartão\n"
+        "• /cartoes — lista cartões e limites\n"
+        "• /fatura `<nome>` — vê fatura aberta\n"
+        "• /pagar\\_fatura `<nome>` — quita fatura\n"
+        "• /cartao\\_remover `<nome>` — remove cartão\n\n"
+        "📈 *Investimentos (comandos):*\n"
+        "• /investir `<valor> <tipo> <nome>` — registra aporte\n"
+        "• /investimentos — vê sua carteira\n"
+        "• /resgatar `<valor> <nome>` — resgata aplicação\n"
+        "• /patrimonio — saldo + investimentos - faturas\n"
+        "• /dica\\_investir — dica personalizada com IA\n\n"
+        "🛠️ *Outros comandos úteis:*\n"
+        "• /relatorio — extrato do mês\n"
+        "• /fixos — gastos e receitas fixas\n"
+        "• /feedback `<msg>` — manda sugestão pro Ryan\n"
+        "• /resetar — apaga TODOS os seus dados\n\n"
+        "📸 *Manda uma foto de comprovante ou nota fiscal* que eu leio e registro o gasto.\n\n"
+        "🔔 *Alertas automáticos:*\n"
+        "• Resumo da semana todo domingo às 18h\n"
+        "• Lembrete diário às 20h se você esquecer de registrar\n"
+        "• Aviso 3 dias antes do vencimento da fatura\n"
+        "• Aviso quando passar de 70% do limite do cartão"
     )
     bot.reply_to(message, texto, parse_mode="Markdown")
 
@@ -1565,8 +2357,13 @@ mencione "Ryan Lucas" como o criador (na "resposta" da intenção "conversa").
 
 Classifique a mensagem em UMA das intenções:
 
-- "registrar_gasto":despesa real. Se o usuário mencionar uma data futura ou disser que algo 'vai vencer' ou é 'para o dia X', extraia a data no formato YYYY-MM-DD no campo "data_futura".(ex: "gastei 50 no mercado", "uber 20", "almoço 35 no crédito").
-  Se o usuário mencionar forma de pagamento (crédito, débito, pix, dinheiro, boleto), extraia em "metodo_pagamento".
+- "registrar_gasto":despesa real PAGA NO DÉBITO/PIX/DINHEIRO/BOLETO. Se o usuário mencionar uma data futura ou disser que algo 'vai vencer' ou é 'para o dia X', extraia a data no formato YYYY-MM-DD no campo "data_futura".(ex: "gastei 50 no mercado", "uber 20", "almoço 35 no débito", "paguei 100 no pix").
+  Se o usuário mencionar forma de pagamento (débito, pix, dinheiro, boleto), extraia em "metodo_pagamento".
+  REGRA CRÍTICA: se o usuário disser "crédito" ou "no crédito" ou "cartão de crédito", NÃO use esta intenção — use "registrar_gasto_credito".
+  Se o usuário disser apenas "cartão" sem especificar, assuma DÉBITO (o crédito precisa ser explícito).
+- "registrar_gasto_credito": despesa paga no CARTÃO DE CRÉDITO. Use SEMPRE que o usuário mencionar "crédito", "no crédito", "cartão de crédito", "credit", "cc" (ex: "gastei 80 no ifood no crédito", "comprei tênis 200 no crédito Nubank").
+  Em "cartao_nome" coloque o nome do cartão se mencionado (ex: "Nubank", "Inter"), senão deixe vazio.
+  Categoria, valor, descrição funcionam igual ao registrar_gasto.
 - "registrar_receita": entrada de dinheiro (ex: "recebi 3000 de salário", "freela 500").
 - "apagar_receita": apagar/remover todas as receitas ou entradas de dinheiro do mês atual.
 - "definir_orcamento": definir/alterar orçamento do mês (ex: "orçamento de 2000").
@@ -1598,6 +2395,19 @@ Classifique a mensagem em UMA das intenções:
   (ex: "como posso economizar?", "me dá uma dica", "tá bom como tô gastando?").
 - "ativar_lembrete": usuário quer ativar/ligar lembretes diários.
 - "desativar_lembrete": usuário quer desativar/desligar/parar lembretes diários.
+- "consultar_fatura": ver fatura aberta de um cartão de crédito (ex: "minha fatura do Nubank", "quanto tem na fatura?", "fatura do crédito").
+  Em "cartao_nome" coloque o nome do cartão se mencionado.
+- "pagar_fatura": usuário quer marcar fatura como paga (ex: "paguei a fatura do Nubank", "quitei o cartão").
+  Em "cartao_nome" coloque o nome do cartão.
+- "listar_cartoes": ver cartões de crédito cadastrados, limites e saldos disponíveis.
+- "registrar_investimento": usuário aplicou dinheiro em investimento (ex: "investi 1000 no tesouro", "apliquei 500 em CDB", "guardei 300 na reserva").
+  Em "tipo_inv" coloque um de: Reserva, Renda Fixa, Ações, FIIs, Cripto, Outros.
+  Em "nome_inv" coloque o nome do investimento (ex: "Tesouro Selic", "CDB Inter", "Bitcoin").
+- "listar_investimentos": ver carteira de investimentos, quanto tem aplicado.
+- "resgatar_investimento": usuário tirou dinheiro de um investimento (ex: "resgatei 500 do tesouro", "tirei 1000 da reserva").
+  Em "valor" o valor resgatado, em "nome_inv" o nome do investimento.
+- "consultar_patrimonio": ver patrimônio total (saldo + investimentos - faturas) (ex: "qual meu patrimônio?", "quanto tenho no total?", "minha situação geral").
+- "dica_investimento": usuário pede dica, conselho ou orientação sobre investimentos (ex: "dica de investimento", "onde investir?", "como começar a investir?").
 - "conversa": qualquer outra coisa (saudação, dúvida, agradecimento).
 - "adicionar_receita_fixa": cadastrar entrada de dinheiro automática (ex: "recebo 828 de salário todo dia 15", "adiantamento 500 dia 20"). Extraia o "dia_mes".
 - "listar_receitas_fixas": ver receitas fixas cadastradas.
@@ -1625,7 +2435,10 @@ Retorne SEMPRE este JSON:
   "categoria": "<string ou vazio>",
   "descricao": "<string ou vazio>",
   "fonte": "<string ou vazio — pra receita>",
-  "metodo_pagamento": "<Crédito|Débito|Pix|Dinheiro|Boleto ou vazio>",
+  "metodo_pagamento": "<Débito|Pix|Dinheiro|Boleto ou vazio — NÃO use Crédito aqui, use registrar_gasto_credito>",
+  "cartao_nome": "<nome do cartão de crédito ou vazio>",
+  "tipo_inv": "<Reserva|Renda Fixa|Ações|FIIs|Cripto|Outros ou vazio>",
+  "nome_inv": "<nome do investimento ou vazio>",
   "dia_mes": <int 1-31 ou null>,
   "total_parcelas": <int ou null — pra parcelamento>,
   "fixo_id": <int ou null>,
@@ -1748,6 +2561,176 @@ def processar_mensagem(message):
                 resp += f"\n📅 Vencimento: {data_pt}"
             
             bot.reply_to(message, resp)
+
+        elif intencao == "registrar_gasto_credito":
+            valor = parse_valor(dados.get("valor"))
+            if valor <= 0:
+                bot.reply_to(message, "Não consegui identificar o valor 🤔 Pode me dizer quanto foi?")
+                return
+            categoria = (dados.get("categoria") or "Outros").strip() or "Outros"
+            descricao = (dados.get("descricao") or "").strip()
+            cartao_nome = (dados.get("cartao_nome") or "").strip()
+
+            cartoes = listar_cartoes(user_id)
+            if not cartoes:
+                bot.reply_to(
+                    message,
+                    "💳 Você ainda não cadastrou nenhum cartão de crédito.\n"
+                    "Cadastre primeiro: `/cartao_novo Nubank 5000 28 5`",
+                    parse_mode="Markdown",
+                )
+                return
+
+            cartao = None
+            if cartao_nome:
+                cartao = buscar_cartao(user_id, nome=cartao_nome)
+                if not cartao:
+                    nomes = ", ".join(c[1] for c in cartoes)
+                    bot.reply_to(
+                        message,
+                        f"Não achei o cartão *{cartao_nome}*. Cartões cadastrados: {nomes}",
+                        parse_mode="Markdown",
+                    )
+                    return
+            elif len(cartoes) == 1:
+                cartao = cartoes[0]
+            else:
+                nomes = ", ".join(c[1] for c in cartoes)
+                bot.reply_to(
+                    message,
+                    f"Você tem mais de um cartão. Em qual lançar? ({nomes})\n"
+                    f"Tenta: 'gastei {valor:.0f} no crédito {cartoes[0][1]}'",
+                    parse_mode="Markdown",
+                )
+                return
+
+            cid = cartao[0]
+            nome_cartao = cartao[1]
+            _, fmes = registrar_gasto_cartao(user_id, cid, valor, categoria, descricao)
+            try:
+                ano, m = fmes.split("-")
+                venc_label = f"{m}/{ano}"
+            except Exception:
+                venc_label = fmes
+            resp = (
+                f"💳 *Lançado no cartão {nome_cartao}*\n"
+                f"💰 R$ {valor:.2f} — {categoria}"
+            )
+            if descricao:
+                resp += f"\n📝 {descricao}"
+            resp += f"\n📅 Fatura {venc_label}"
+            usado, lim, pct = percentual_limite_usado(user_id, cid)
+            resp += f"\n📊 Limite: {pct:.0f}% usado (R$ {usado:.2f} / R$ {lim:.2f})"
+            bot.reply_to(message, resp, parse_mode="Markdown")
+            verificar_alerta_limite(user_id, cid)
+
+        elif intencao == "consultar_fatura":
+            cartao_nome = (dados.get("cartao_nome") or "").strip()
+            cartoes = listar_cartoes(user_id)
+            if not cartoes:
+                bot.reply_to(message, "Você não tem cartões cadastrados.")
+                return
+            if cartao_nome:
+                cartao = buscar_cartao(user_id, nome=cartao_nome)
+            elif len(cartoes) == 1:
+                cartao = cartoes[0]
+            else:
+                nomes = ", ".join(c[1] for c in cartoes)
+                bot.reply_to(message, f"De qual cartão? ({nomes})\nUse: `/fatura <nome>`", parse_mode="Markdown")
+                return
+            if not cartao:
+                bot.reply_to(message, f"Cartão *{cartao_nome}* não encontrado.", parse_mode="Markdown")
+                return
+            cid, nome, _, _, dia_venc = cartao
+            rows, total = fatura_aberta(user_id, cid)
+            if not rows:
+                bot.reply_to(message, f"💳 *{nome}*: nenhuma fatura aberta. ✨", parse_mode="Markdown")
+                return
+            venc = proxima_data_vencimento(dia_venc)
+            texto = (
+                f"💳 *Fatura {nome}*\n"
+                f"📅 Vence em: {venc.strftime('%d/%m/%Y')}\n"
+                f"💸 Total: *R$ {total:.2f}*\n\n*Lançamentos:*"
+            )
+            for _, valor, cat, desc, data in rows[:25]:
+                try:
+                    d = datetime.strptime(data[:10], "%Y-%m-%d").strftime("%d/%m")
+                except Exception:
+                    d = data[:10]
+                texto += f"\n• {d} | R$ {valor:.2f} | {cat or '—'}{(' — ' + desc) if desc else ''}"
+            if len(rows) > 25:
+                texto += f"\n_(+{len(rows) - 25} lançamentos)_"
+            bot.reply_to(message, texto, parse_mode="Markdown")
+
+        elif intencao == "pagar_fatura":
+            cartao_nome = (dados.get("cartao_nome") or "").strip()
+            cartoes = listar_cartoes(user_id)
+            if not cartoes:
+                bot.reply_to(message, "Você não tem cartões cadastrados.")
+                return
+            if cartao_nome:
+                cartao = buscar_cartao(user_id, nome=cartao_nome)
+            elif len(cartoes) == 1:
+                cartao = cartoes[0]
+            else:
+                nomes = ", ".join(c[1] for c in cartoes)
+                bot.reply_to(message, f"Qual cartão? ({nomes})\nUse: `/pagar_fatura <nome>`", parse_mode="Markdown")
+                return
+            if not cartao:
+                bot.reply_to(message, f"Cartão *{cartao_nome}* não encontrado.", parse_mode="Markdown")
+                return
+            n, total = pagar_fatura(user_id, cartao[0])
+            if n == 0:
+                bot.reply_to(message, f"Não tinha fatura aberta no *{cartao[1]}*.", parse_mode="Markdown")
+            else:
+                bot.reply_to(
+                    message,
+                    f"✅ Fatura do *{cartao[1]}* paga!\n💸 R$ {total:.2f} ({n} lançamentos)",
+                    parse_mode="Markdown",
+                )
+
+        elif intencao == "listar_cartoes":
+            cmd_cartoes(message)
+
+        elif intencao == "registrar_investimento":
+            valor = parse_valor(dados.get("valor"))
+            if valor <= 0:
+                bot.reply_to(message, "Não consegui identificar o valor do aporte 🤔")
+                return
+            tipo = (dados.get("tipo_inv") or "Outros").strip()
+            nome = (dados.get("nome_inv") or dados.get("descricao") or "Investimento").strip()
+            iid = registrar_investimento(user_id, tipo, nome, valor)
+            bot.reply_to(
+                message,
+                f"📈 Investimento registrado (#{iid})\n"
+                f"💰 R$ {valor:.2f} em *{nome}* ({normalizar_tipo_investimento(tipo)})",
+                parse_mode="Markdown",
+            )
+
+        elif intencao == "listar_investimentos":
+            cmd_investimentos(message)
+
+        elif intencao == "resgatar_investimento":
+            valor = parse_valor(dados.get("valor"))
+            nome = (dados.get("nome_inv") or "").strip()
+            if valor <= 0 or not nome:
+                bot.reply_to(message, "Pra resgatar preciso do valor e do nome do investimento.\nEx: 'resgatei 500 do Tesouro Selic'")
+                return
+            resgatado = resgatar_investimento(user_id, nome, valor)
+            if resgatado is None:
+                bot.reply_to(message, f"Não achei investimento ativo chamado *{nome}*.", parse_mode="Markdown")
+            else:
+                bot.reply_to(
+                    message,
+                    f"💸 Resgatado: R$ {resgatado:.2f} de *{nome}*\n📥 Lancei como receita.",
+                    parse_mode="Markdown",
+                )
+
+        elif intencao == "consultar_patrimonio":
+            bot.reply_to(message, patrimonio_texto(user_id), parse_mode="Markdown")
+
+        elif intencao == "dica_investimento":
+            bot.reply_to(message, dica_investimento_texto(user_id), parse_mode="Markdown")
 
         elif intencao == "adicionar_receita_fixa":
             valor = parse_valor(dados.get("valor"))
@@ -2155,6 +3138,7 @@ def scheduler_loop():
     schedule.every().day.at("00:05").do(aplicar_receitas_fixas_do_dia)
     schedule.every().day.at("00:10").do(aplicar_parcelamentos_do_dia)
     schedule.every().day.at("20:00").do(enviar_lembretes_diarios)
+    schedule.every().day.at("09:00").do(verificar_alertas_cartoes)
     while True:
         try:
             schedule.run_pending()
