@@ -591,18 +591,42 @@ def total_investimentos(user_id):
     return total or 0
 
 
-def resgatar_investimento(user_id, nome, valor):
-    """Reduz o valor do investimento e adiciona como receita. Se zerar, marca inativo."""
+def resgatar_investimento(user_id, nome, valor, tipo_hint=None):
+    """Reduz o valor do investimento e adiciona como receita. Se zerar, marca inativo.
+    Aceita identificadores variados: nome exato, parcial, id (3 ou #3), ou tipo (Renda Fixa).
+    Retorna (valor_resgatado, nome_real) ou None."""
+    # 1) Tenta achar usando o buscador inteligente (id, #id, nome parcial)
+    inv = None
+    if nome:
+        inv = buscar_investimento(user_id, nome)
+    # 2) Se não achou e veio um tipo (ou o "nome" parece um tipo), busca por tipo
+    if not inv:
+        candidato_tipo = tipo_hint or nome
+        if candidato_tipo:
+            tipo_norm = normalizar_tipo_investimento(candidato_tipo)
+            conn_t = db()
+            rows_tipo = conn_t.execute(
+                "SELECT id, nome, valor FROM investimentos "
+                "WHERE user_id = ? AND ativo = 1 AND tipo = ? ORDER BY data DESC",
+                (user_id, tipo_norm),
+            ).fetchall()
+            conn_t.close()
+            if len(rows_tipo) == 1:
+                inv = (rows_tipo[0][0], tipo_norm, rows_tipo[0][1], rows_tipo[0][2])
+            elif len(rows_tipo) > 1:
+                return ("varios_no_tipo", tipo_norm, [(r[0], r[1], r[2]) for r in rows_tipo])
+    if not inv:
+        return None
+    inv_id, _tipo, nome_real, atual = inv
     conn = db()
     row = conn.execute(
-        "SELECT id, valor FROM investimentos WHERE user_id = ? AND ativo = 1 "
-        "AND LOWER(nome) = LOWER(?) ORDER BY data DESC LIMIT 1",
-        (user_id, nome),
+        "SELECT valor FROM investimentos WHERE id = ? AND ativo = 1", (inv_id,)
     ).fetchone()
     if not row:
         conn.close()
         return None
-    inv_id, atual = row
+    atual = row[0]
+    nome = nome_real
     if valor >= atual:
         valor = atual
         conn.execute("UPDATE investimentos SET valor = 0, ativo = 0 WHERE id = ?", (inv_id,))
@@ -615,7 +639,7 @@ def resgatar_investimento(user_id, nome, valor):
     )
     conn.commit()
     conn.close()
-    return valor
+    return (valor, nome)
 
 
 def buscar_investimento(user_id, identificador):
@@ -2711,8 +2735,10 @@ Classifique a mensagem em UMA das intenções:
   Em "tipo_inv" coloque um de: Reserva, Renda Fixa, Ações, FIIs, Cripto, Outros.
   Em "nome_inv" coloque o nome do investimento (ex: "Tesouro Selic", "CDB Inter", "Bitcoin").
 - "listar_investimentos": ver carteira de investimentos, quanto tem aplicado.
-- "resgatar_investimento": usuário tirou dinheiro de um investimento PARA O SALDO/CONTA (ex: "resgatei 500 do tesouro", "tirei 1000 da reserva pra conta", "saquei 200 da poupança").
-  Em "valor" o valor resgatado, em "nome_inv" o nome do investimento.
+- "resgatar_investimento": usuário tirou dinheiro de um investimento PARA O SALDO/CONTA (ex: "resgatei 500 do tesouro", "quero resgatar 28 da renda fixa", "tirei 1000 da reserva pra conta", "saquei 200 da poupança", "resgatei 28 do #2", "resgata 100 da caixinha do nubank").
+  Em "valor" o valor resgatado.
+  Em "nome_inv" coloque o que identificar o investimento — pode ser o nome ("Tesouro Selic", "caixinha do nubank"), o id ("2" ou "#2"), OU o tipo ("renda fixa", "reserva", "cripto") se for o único jeito que o usuário se referiu.
+  Em "tipo_inv" coloque o tipo se mencionado explicitamente (Reserva, Renda Fixa, Ações, FIIs, Cripto, Outros).
   ATENÇÃO: NÃO use esta intenção se o usuário quiser mover entre investimentos — use "transferir_investimento". Nem se ele quiser apagar — use "remover_investimento".
 - "editar_investimento": usuário quer RENOMEAR ou RECATEGORIZAR um investimento sem mover dinheiro
   (ex: "muda a caixinha pra reserva de emergência", "renomeia o tesouro pra Tesouro Selic 2030",
@@ -3036,17 +3062,29 @@ def processar_mensagem(message):
 
         elif intencao == "resgatar_investimento":
             valor = parse_valor(dados.get("valor"))
-            nome = (dados.get("nome_inv") or "").strip()
-            if valor <= 0 or not nome:
-                bot.reply_to(message, "Pra resgatar preciso do valor e do nome do investimento.\nEx: 'resgatei 500 do Tesouro Selic'")
+            # Tenta nome_inv, depois inv_origem (caso a IA tenha confundido), depois tipo_inv
+            nome = (dados.get("nome_inv") or dados.get("inv_origem") or "").strip()
+            tipo_hint = (dados.get("tipo_inv") or "").strip() or None
+            if valor <= 0 or (not nome and not tipo_hint):
+                bot.reply_to(message, "Pra resgatar preciso do valor e do nome (ou tipo) do investimento.\nEx: 'resgatei 500 do Tesouro Selic' ou 'resgatei 100 da renda fixa'")
                 return
-            resgatado = resgatar_investimento(user_id, nome, valor)
+            resgatado = resgatar_investimento(user_id, nome, valor, tipo_hint)
             if resgatado is None:
-                bot.reply_to(message, f"Não achei investimento ativo chamado *{nome}*.", parse_mode="Markdown")
-            else:
+                ref = nome or tipo_hint
+                bot.reply_to(message, f"Não achei investimento ativo com *{ref}*.", parse_mode="Markdown")
+            elif isinstance(resgatado, tuple) and resgatado[0] == "varios_no_tipo":
+                _, tipo_norm, lista = resgatado
+                opcoes = "\n".join(f"• #{i} — {n} (R$ {v:.2f})" for i, n, v in lista)
                 bot.reply_to(
                     message,
-                    f"💸 Resgatado: R$ {resgatado:.2f} de *{nome}*\n📥 Lancei como receita.",
+                    f"🤔 Você tem mais de um investimento em *{tipo_norm}*. Qual?\n{opcoes}\n\nResponde com o nome ou o id (ex: 'resgatei {valor:.0f} do #{lista[0][0]}').",
+                    parse_mode="Markdown",
+                )
+            else:
+                valor_resg, nome_real = resgatado
+                bot.reply_to(
+                    message,
+                    f"💸 Resgatado: R$ {valor_resg:.2f} de *{nome_real}*\n📥 Lancei como receita.",
                     parse_mode="Markdown",
                 )
 
