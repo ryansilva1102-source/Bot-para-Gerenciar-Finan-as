@@ -618,6 +618,111 @@ def resgatar_investimento(user_id, nome, valor):
     return valor
 
 
+def buscar_investimento(user_id, identificador):
+    """Encontra investimento ativo por ID (int) ou nome (busca parcial, case-insensitive)."""
+    conn = db()
+    row = None
+    if isinstance(identificador, int) or (isinstance(identificador, str) and identificador.isdigit()):
+        row = conn.execute(
+            "SELECT id, tipo, nome, valor FROM investimentos "
+            "WHERE user_id = ? AND id = ? AND ativo = 1",
+            (user_id, int(identificador)),
+        ).fetchone()
+    if not row and isinstance(identificador, str):
+        # Tenta nome exato
+        row = conn.execute(
+            "SELECT id, tipo, nome, valor FROM investimentos "
+            "WHERE user_id = ? AND ativo = 1 AND LOWER(nome) = LOWER(?) "
+            "ORDER BY data DESC LIMIT 1",
+            (user_id, identificador.strip()),
+        ).fetchone()
+        # Senão, busca parcial
+        if not row:
+            row = conn.execute(
+                "SELECT id, tipo, nome, valor FROM investimentos "
+                "WHERE user_id = ? AND ativo = 1 AND LOWER(nome) LIKE LOWER(?) "
+                "ORDER BY data DESC LIMIT 1",
+                (user_id, f"%{identificador.strip()}%"),
+            ).fetchone()
+    conn.close()
+    return row
+
+
+def editar_investimento(user_id, identificador, novo_nome=None, novo_tipo=None, novo_valor=None):
+    """Renomeia/recategoriza/ajusta valor de um investimento existente. NÃO mexe no saldo."""
+    inv = buscar_investimento(user_id, identificador)
+    if not inv:
+        return None
+    inv_id, tipo_atual, nome_atual, valor_atual = inv
+    novos = {}
+    if novo_nome and novo_nome.strip() and novo_nome.strip().lower() != nome_atual.lower():
+        novos["nome"] = novo_nome.strip()
+    if novo_tipo:
+        tipo_norm = normalizar_tipo_investimento(novo_tipo)
+        if tipo_norm != tipo_atual:
+            novos["tipo"] = tipo_norm
+    if novo_valor is not None and novo_valor > 0 and abs(novo_valor - valor_atual) > 0.01:
+        novos["valor"] = float(novo_valor)
+    if not novos:
+        return ("nada", inv)
+    sets = ", ".join(f"{k} = ?" for k in novos)
+    args = list(novos.values()) + [inv_id]
+    conn = db()
+    conn.execute(f"UPDATE investimentos SET {sets} WHERE id = ?", args)
+    conn.commit()
+    atualizado = conn.execute(
+        "SELECT id, tipo, nome, valor FROM investimentos WHERE id = ?", (inv_id,)
+    ).fetchone()
+    conn.close()
+    return ("ok", atualizado, inv)
+
+
+def transferir_investimento(user_id, nome_origem, nome_destino, valor, tipo_destino=None):
+    """Move R$valor de uma aplicação para outra (cria nova ou soma à existente).
+    NÃO afeta saldo (dinheiro nunca saiu da carteira de investimentos)."""
+    origem = buscar_investimento(user_id, nome_origem)
+    if not origem:
+        return ("origem_nao_encontrada", None, None)
+    inv_id_orig, tipo_orig, nome_orig, valor_orig = origem
+    if valor <= 0:
+        return ("valor_invalido", None, None)
+    if valor > valor_orig + 0.01:
+        return ("saldo_insuficiente", origem, None)
+
+    conn = db()
+    # Reduz origem (zera e inativa se esvaziar)
+    if abs(valor - valor_orig) < 0.01:
+        conn.execute("UPDATE investimentos SET valor = 0, ativo = 0 WHERE id = ?", (inv_id_orig,))
+    else:
+        conn.execute("UPDATE investimentos SET valor = valor - ? WHERE id = ?", (valor, inv_id_orig))
+
+    # Cria/soma destino
+    destino = conn.execute(
+        "SELECT id, tipo, nome, valor FROM investimentos "
+        "WHERE user_id = ? AND ativo = 1 AND LOWER(nome) = LOWER(?) ORDER BY data DESC LIMIT 1",
+        (user_id, nome_destino.strip()),
+    ).fetchone()
+    tipo_dest = normalizar_tipo_investimento(tipo_destino) if tipo_destino else (destino[1] if destino else "Outros")
+    if destino:
+        conn.execute("UPDATE investimentos SET valor = valor + ?, tipo = ? WHERE id = ?",
+                     (valor, tipo_dest, destino[0]))
+        novo_id = destino[0]
+    else:
+        cur = conn.execute(
+            "INSERT INTO investimentos (user_id, tipo, nome, valor, data, ativo) "
+            "VALUES (?, ?, ?, ?, ?, 1)",
+            (user_id, tipo_dest, nome_destino.strip(), valor,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        novo_id = cur.lastrowid
+    conn.commit()
+    info_destino = conn.execute(
+        "SELECT id, tipo, nome, valor FROM investimentos WHERE id = ?", (novo_id,)
+    ).fetchone()
+    conn.close()
+    return ("ok", origem, info_destino)
+
+
 def patrimonio_texto(user_id):
     """Saldo + investimentos - faturas abertas = patrimônio líquido."""
     conn = db()
@@ -2103,6 +2208,126 @@ def cmd_resgatar(message):
     )
 
 
+@bot.message_handler(commands=["editar_investir"])
+def cmd_editar_investir(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=1)
+    if len(partes) < 2:
+        bot.reply_to(
+            message,
+            "Uso: `/editar_investir <id_ou_nome> [tipo:NovoTipo] [nome:Novo Nome] [valor:1234]`\n\n"
+            "Exemplos:\n"
+            "• `/editar_investir caixinha tipo:Reserva nome:Reserva de Emergência`\n"
+            "• `/editar_investir 3 valor:2500`\n"
+            "• `/editar_investir Tesouro nome:Tesouro Selic 2030`",
+            parse_mode="Markdown",
+        )
+        return
+    args = partes[1].strip()
+    # Extrai pares chave:valor
+    novo_tipo = None
+    novo_nome = None
+    novo_valor = None
+    import re as _re
+    matches = list(_re.finditer(r"(tipo|nome|valor)\s*:\s*", args, _re.IGNORECASE))
+    if not matches:
+        bot.reply_to(message, "Não achei nenhum campo (tipo:, nome: ou valor:) pra editar.\nUse `/editar_investir` sem nada pra ver exemplos.", parse_mode="Markdown")
+        return
+    identificador = args[:matches[0].start()].strip()
+    for i, m in enumerate(matches):
+        chave = m.group(1).lower()
+        ini = m.end()
+        fim = matches[i + 1].start() if i + 1 < len(matches) else len(args)
+        valor_raw = args[ini:fim].strip()
+        if chave == "tipo":
+            novo_tipo = valor_raw
+        elif chave == "nome":
+            novo_nome = valor_raw
+        elif chave == "valor":
+            try:
+                novo_valor = float(valor_raw.replace("R$", "").replace(",", ".").strip())
+            except ValueError:
+                bot.reply_to(message, f"Valor inválido: `{valor_raw}`", parse_mode="Markdown")
+                return
+    if not identificador:
+        bot.reply_to(message, "Você precisa dizer qual investimento editar (id ou nome).", parse_mode="Markdown")
+        return
+    res = editar_investimento(user_id, identificador, novo_nome, novo_tipo, novo_valor)
+    if res is None:
+        bot.reply_to(message, f"Não achei investimento ativo com *{identificador}*.", parse_mode="Markdown")
+        return
+    if res[0] == "nada":
+        bot.reply_to(message, "Nada pra mudar — os valores informados são iguais aos atuais.")
+        return
+    _, atualizado, antigo = res
+    bot.reply_to(
+        message,
+        f"✏️ *Investimento atualizado!*\n"
+        f"De: {antigo[2]} ({antigo[1]}) — R$ {antigo[3]:.2f}\n"
+        f"Para: *{atualizado[2]}* ({atualizado[1]}) — R$ {atualizado[3]:.2f}",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["transferir_investir"])
+def cmd_transferir_investir(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    # /transferir_investir 500 caixinha para Reserva [tipo:Reserva]
+    txt = message.text.split(maxsplit=1)
+    if len(txt) < 2:
+        bot.reply_to(
+            message,
+            "Uso: `/transferir_investir <valor> <origem> para <destino> [tipo:X]`\n"
+            "Ex: `/transferir_investir 500 caixinha para Reserva de Emergência tipo:Reserva`",
+            parse_mode="Markdown",
+        )
+        return
+    args = txt[1]
+    import re as _re
+    tipo_destino = None
+    m_tipo = _re.search(r"tipo\s*:\s*([\w\sçãéí]+)$", args, _re.IGNORECASE)
+    if m_tipo:
+        tipo_destino = m_tipo.group(1).strip()
+        args = args[:m_tipo.start()].strip()
+    m = _re.match(r"^([\d\.,]+)\s+(.+?)\s+(?:para|pra|->|→)\s+(.+)$", args, _re.IGNORECASE)
+    if not m:
+        bot.reply_to(message, "Formato inválido. Use: `<valor> <origem> para <destino>`", parse_mode="Markdown")
+        return
+    try:
+        valor = float(m.group(1).replace(",", "."))
+    except ValueError:
+        bot.reply_to(message, "Valor inválido.")
+        return
+    origem_nome = m.group(2).strip()
+    destino_nome = m.group(3).strip()
+    status, origem, destino = transferir_investimento(user_id, origem_nome, destino_nome, valor, tipo_destino)
+    if status == "origem_nao_encontrada":
+        bot.reply_to(message, f"Não achei investimento ativo chamado *{origem_nome}*.", parse_mode="Markdown")
+        return
+    if status == "valor_invalido":
+        bot.reply_to(message, "O valor da transferência tem que ser maior que zero.")
+        return
+    if status == "saldo_insuficiente":
+        bot.reply_to(
+            message,
+            f"💸 Saldo insuficiente em *{origem[2]}* (você tem R$ {origem[3]:.2f}).",
+            parse_mode="Markdown",
+        )
+        return
+    bot.reply_to(
+        message,
+        f"🔄 *Transferência feita!*\n"
+        f"R$ {valor:.2f} saiu de *{origem[2]}* ({origem[1]})\n"
+        f"➡️ Foi pra *{destino[2]}* ({destino[1]}) — agora total R$ {destino[3]:.2f}\n"
+        f"_O dinheiro continua na sua carteira de investimentos, só mudou de lugar._",
+        parse_mode="Markdown",
+    )
+
+
 @bot.message_handler(commands=["patrimonio"])
 def cmd_patrimonio(message):
     user_id = message.chat.id
@@ -2414,8 +2639,19 @@ Classifique a mensagem em UMA das intenções:
   Em "tipo_inv" coloque um de: Reserva, Renda Fixa, Ações, FIIs, Cripto, Outros.
   Em "nome_inv" coloque o nome do investimento (ex: "Tesouro Selic", "CDB Inter", "Bitcoin").
 - "listar_investimentos": ver carteira de investimentos, quanto tem aplicado.
-- "resgatar_investimento": usuário tirou dinheiro de um investimento (ex: "resgatei 500 do tesouro", "tirei 1000 da reserva").
+- "resgatar_investimento": usuário tirou dinheiro de um investimento PARA O SALDO/CONTA (ex: "resgatei 500 do tesouro", "tirei 1000 da reserva pra conta", "saquei 200 da poupança").
   Em "valor" o valor resgatado, em "nome_inv" o nome do investimento.
+  ATENÇÃO: NÃO use esta intenção se o usuário quiser mover entre investimentos — use "transferir_investimento".
+- "editar_investimento": usuário quer RENOMEAR ou RECATEGORIZAR um investimento sem mover dinheiro
+  (ex: "muda a caixinha pra reserva de emergência", "renomeia o tesouro pra Tesouro Selic 2030",
+  "muda o tipo do CDB pra Renda Fixa", "ajusta o valor do bitcoin pra 5000").
+  Em "inv_origem" coloque o nome ou id do investimento atual.
+  Em "nome_inv" coloque o NOVO nome (se mudar nome). Em "tipo_inv" o NOVO tipo (se mudar tipo).
+  Em "valor" o NOVO valor (só se for ajustar valor, ex: "ajusta cripto pra 5000").
+- "transferir_investimento": usuário quer MOVER dinheiro de um investimento pra outro (sem cair no saldo)
+  (ex: "passa 500 da caixinha pra reserva", "transfere 1000 do tesouro pro CDB", "move 200 da poupança pra cripto").
+  Em "valor" o valor a transferir, em "inv_origem" o nome do investimento de origem,
+  em "nome_inv" o nome do investimento de destino, em "tipo_inv" o tipo do destino se mencionado.
 - "consultar_patrimonio": ver patrimônio total (saldo + investimentos - faturas) (ex: "qual meu patrimônio?", "quanto tenho no total?", "minha situação geral").
 - "dica_investimento": usuário pede dica, conselho ou orientação sobre investimentos (ex: "dica de investimento", "onde investir?", "como começar a investir?").
 - "conversa": qualquer outra coisa (saudação, dúvida, agradecimento).
@@ -2448,7 +2684,8 @@ Retorne SEMPRE este JSON:
   "metodo_pagamento": "<Débito|Pix|Dinheiro|Boleto ou vazio — NÃO use Crédito aqui, use registrar_gasto_credito>",
   "cartao_nome": "<nome do cartão de crédito ou vazio>",
   "tipo_inv": "<Reserva|Renda Fixa|Ações|FIIs|Cripto|Outros ou vazio>",
-  "nome_inv": "<nome do investimento ou vazio>",
+  "nome_inv": "<nome do investimento (ou nome de DESTINO em transferências/edições) ou vazio>",
+  "inv_origem": "<nome ou id do investimento de ORIGEM em editar/transferir, ou vazio>",
   "dia_mes": <int 1-31 ou null>,
   "total_parcelas": <int ou null — pra parcelamento>,
   "fixo_id": <int ou null>,
@@ -2733,6 +2970,59 @@ def processar_mensagem(message):
                 bot.reply_to(
                     message,
                     f"💸 Resgatado: R$ {resgatado:.2f} de *{nome}*\n📥 Lancei como receita.",
+                    parse_mode="Markdown",
+                )
+
+        elif intencao == "editar_investimento":
+            origem = (dados.get("inv_origem") or "").strip()
+            if not origem:
+                bot.reply_to(message, "Pra editar preciso saber qual investimento. Ex: 'muda a caixinha pra reserva de emergência'")
+                return
+            novo_nome = (dados.get("nome_inv") or "").strip() or None
+            novo_tipo = (dados.get("tipo_inv") or "").strip() or None
+            novo_valor = parse_valor(dados.get("valor"))
+            novo_valor = novo_valor if novo_valor and novo_valor > 0 else None
+            res = editar_investimento(user_id, origem, novo_nome, novo_tipo, novo_valor)
+            if res is None:
+                bot.reply_to(message, f"Não achei investimento ativo com *{origem}*.", parse_mode="Markdown")
+            elif res[0] == "nada":
+                bot.reply_to(message, "Nada pra mudar — os valores são iguais aos atuais.")
+            else:
+                _, atu, ant = res
+                bot.reply_to(
+                    message,
+                    f"✏️ *Investimento atualizado!*\n"
+                    f"De: {ant[2]} ({ant[1]}) — R$ {ant[3]:.2f}\n"
+                    f"Para: *{atu[2]}* ({atu[1]}) — R$ {atu[3]:.2f}",
+                    parse_mode="Markdown",
+                )
+
+        elif intencao == "transferir_investimento":
+            valor = parse_valor(dados.get("valor"))
+            origem = (dados.get("inv_origem") or "").strip()
+            destino = (dados.get("nome_inv") or "").strip()
+            tipo_destino = (dados.get("tipo_inv") or "").strip() or None
+            if valor <= 0 or not origem or not destino:
+                bot.reply_to(message, "Pra transferir preciso do valor, da origem e do destino.\nEx: 'passa 500 da caixinha pra reserva de emergência'")
+                return
+            status, info_orig, info_dest = transferir_investimento(user_id, origem, destino, valor, tipo_destino)
+            if status == "origem_nao_encontrada":
+                bot.reply_to(message, f"Não achei investimento ativo chamado *{origem}*.", parse_mode="Markdown")
+            elif status == "saldo_insuficiente":
+                bot.reply_to(
+                    message,
+                    f"💸 Saldo insuficiente em *{info_orig[2]}* (você tem R$ {info_orig[3]:.2f}).",
+                    parse_mode="Markdown",
+                )
+            elif status == "valor_invalido":
+                bot.reply_to(message, "Valor inválido pra transferência.")
+            else:
+                bot.reply_to(
+                    message,
+                    f"🔄 *Transferência feita!*\n"
+                    f"R$ {valor:.2f} saiu de *{info_orig[2]}* ({info_orig[1]})\n"
+                    f"➡️ Foi pra *{info_dest[2]}* ({info_dest[1]}) — agora total R$ {info_dest[3]:.2f}\n"
+                    f"_Continua tudo na sua carteira de investimentos._",
                     parse_mode="Markdown",
                 )
 
