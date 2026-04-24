@@ -619,7 +619,15 @@ def resgatar_investimento(user_id, nome, valor):
 
 
 def buscar_investimento(user_id, identificador):
-    """Encontra investimento ativo por ID (int) ou nome (busca parcial, case-insensitive)."""
+    """Encontra investimento ativo por ID (int) ou nome (busca parcial, case-insensitive).
+    Aceita identificadores como '3', '#3', 'investimento 3', 'caixinha'."""
+    if isinstance(identificador, str):
+        identificador = identificador.strip().lstrip("#").strip()
+        # Se vier algo tipo "investimento 3" ou "aporte 5", pega só o número
+        import re as _re
+        m = _re.fullmatch(r"(?:investimento|aporte|caixinha|n[uú]mero|n[oº°.]*)?\s*#?\s*(\d+)", identificador, _re.IGNORECASE)
+        if m:
+            identificador = m.group(1)
     conn = db()
     row = None
     if isinstance(identificador, int) or (isinstance(identificador, str) and identificador.isdigit()):
@@ -723,6 +731,43 @@ def transferir_investimento(user_id, nome_origem, nome_destino, valor, tipo_dest
     return ("ok", origem, info_destino)
 
 
+def remover_investimento(user_id, identificador):
+    """Apaga DEFINITIVAMENTE um investimento (ativo ou não). NÃO mexe no saldo."""
+    # Normaliza o identificador (remove #, "investimento", etc) — mesma lógica do buscar
+    if isinstance(identificador, str):
+        ident_norm = identificador.strip().lstrip("#").strip()
+        import re as _re
+        m = _re.fullmatch(r"(?:investimento|aporte|caixinha|n[uú]mero|n[oº°.]*)?\s*#?\s*(\d+)", ident_norm, _re.IGNORECASE)
+        if m:
+            ident_norm = m.group(1)
+        identificador = ident_norm
+    inv = buscar_investimento(user_id, identificador)
+    if not inv:
+        # Tenta achar mesmo se já estiver inativo
+        conn = db()
+        if isinstance(identificador, str) and identificador.isdigit():
+            row = conn.execute(
+                "SELECT id, tipo, nome, valor FROM investimentos WHERE user_id = ? AND id = ?",
+                (user_id, int(identificador)),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id, tipo, nome, valor FROM investimentos "
+                "WHERE user_id = ? AND LOWER(nome) LIKE LOWER(?) ORDER BY data DESC LIMIT 1",
+                (user_id, f"%{str(identificador).strip()}%"),
+            ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        inv = row
+    inv_id, tipo, nome, valor = inv
+    conn = db()
+    conn.execute("DELETE FROM investimentos WHERE user_id = ? AND id = ?", (user_id, inv_id))
+    conn.commit()
+    conn.close()
+    return (inv_id, tipo, nome, valor)
+
+
 def patrimonio_texto(user_id):
     """Saldo + investimentos - faturas abertas = patrimônio líquido."""
     conn = db()
@@ -802,7 +847,7 @@ def dica_investimento_texto(user_id):
         "- Se faltar reserva, priorize falar dela.\n"
         "- Termine com uma pergunta motivadora ou próximo passo educativo."
     )
-    # IMPORTANTE: chamada DIRETA ao Gemini, sem usar chamar_ia (que força JSON e usa histórico).
+    # IMPORTANTE: chamada DIRETA ao Gemini (sem JSON forçado, sem poluir histórico do chat).
     # Isso evita que a dica venha embrulhada em JSON e que polua a memória do chat natural.
     try:
         config = types.GenerateContentConfig(system_instruction=instr)
@@ -2226,7 +2271,6 @@ def cmd_editar_investir(message):
         )
         return
     args = partes[1].strip()
-    # Extrai pares chave:valor
     novo_tipo = None
     novo_nome = None
     novo_valor = None
@@ -2276,7 +2320,6 @@ def cmd_transferir_investir(message):
     user_id = message.chat.id
     if not usuario_autorizado(user_id):
         return
-    # /transferir_investir 500 caixinha para Reserva [tipo:Reserva]
     txt = message.text.split(maxsplit=1)
     if len(txt) < 2:
         bot.reply_to(
@@ -2324,6 +2367,35 @@ def cmd_transferir_investir(message):
         f"R$ {valor:.2f} saiu de *{origem[2]}* ({origem[1]})\n"
         f"➡️ Foi pra *{destino[2]}* ({destino[1]}) — agora total R$ {destino[3]:.2f}\n"
         f"_O dinheiro continua na sua carteira de investimentos, só mudou de lugar._",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["remover_investir"])
+def cmd_remover_investir(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=1)
+    if len(partes) < 2:
+        bot.reply_to(
+            message,
+            "Uso: `/remover_investir <id_ou_nome>`\n"
+            "Ex: `/remover_investir caixinha` ou `/remover_investir 3`",
+            parse_mode="Markdown",
+        )
+        return
+    identificador = partes[1].strip()
+    res = remover_investimento(user_id, identificador)
+    if res is None:
+        bot.reply_to(message, f"Não achei nenhum investimento com *{identificador}*.", parse_mode="Markdown")
+        return
+    _, tipo, nome, valor = res
+    bot.reply_to(
+        message,
+        f"🗑️ *Investimento removido!*\n"
+        f"{nome} ({tipo}) — R$ {valor:.2f}\n"
+        f"_Não mexi no seu saldo._",
         parse_mode="Markdown",
     )
 
@@ -2641,17 +2713,22 @@ Classifique a mensagem em UMA das intenções:
 - "listar_investimentos": ver carteira de investimentos, quanto tem aplicado.
 - "resgatar_investimento": usuário tirou dinheiro de um investimento PARA O SALDO/CONTA (ex: "resgatei 500 do tesouro", "tirei 1000 da reserva pra conta", "saquei 200 da poupança").
   Em "valor" o valor resgatado, em "nome_inv" o nome do investimento.
-  ATENÇÃO: NÃO use esta intenção se o usuário quiser mover entre investimentos — use "transferir_investimento".
+  ATENÇÃO: NÃO use esta intenção se o usuário quiser mover entre investimentos — use "transferir_investimento". Nem se ele quiser apagar — use "remover_investimento".
 - "editar_investimento": usuário quer RENOMEAR ou RECATEGORIZAR um investimento sem mover dinheiro
   (ex: "muda a caixinha pra reserva de emergência", "renomeia o tesouro pra Tesouro Selic 2030",
-  "muda o tipo do CDB pra Renda Fixa", "ajusta o valor do bitcoin pra 5000").
-  Em "inv_origem" coloque o nome ou id do investimento atual.
+  "muda o tipo do CDB pra Renda Fixa", "ajusta o valor do bitcoin pra 5000", "zera o valor do investimento #3").
+  Em "inv_origem" coloque o nome OU o número/id do investimento atual (se vier "#3", coloque "3").
   Em "nome_inv" coloque o NOVO nome (se mudar nome). Em "tipo_inv" o NOVO tipo (se mudar tipo).
-  Em "valor" o NOVO valor (só se for ajustar valor, ex: "ajusta cripto pra 5000").
+  Em "valor" o NOVO valor (só se for ajustar valor, ex: "ajusta cripto pra 5000", "zera o valor" → valor 0).
+  REGRA: só use esta intenção quando o usuário quiser ALTERAR algo (nome, tipo, valor) — se ele quiser APAGAR o registro, use "remover_investimento".
 - "transferir_investimento": usuário quer MOVER dinheiro de um investimento pra outro (sem cair no saldo)
   (ex: "passa 500 da caixinha pra reserva", "transfere 1000 do tesouro pro CDB", "move 200 da poupança pra cripto").
   Em "valor" o valor a transferir, em "inv_origem" o nome do investimento de origem,
   em "nome_inv" o nome do investimento de destino, em "tipo_inv" o tipo do destino se mencionado.
+- "remover_investimento": usuário quer APAGAR/EXCLUIR/DELETAR/REMOVER/SUMIR/TIRAR DA LISTA um investimento que cadastrou (ex: "apaga a caixinha", "apague o investimento #1", "remove o investimento da poupança", "deleta o tesouro", "exclui o aporte do bitcoin", "quero excluir o investimento #2", "tira esse investimento da lista").
+  Em "inv_origem" coloque o nome OU o número/id do investimento a remover (se vier "#3", coloque "3"; se vier "investimento 5", coloque "5").
+  REGRA ABSOLUTA: se o usuário usar QUALQUER um dos verbos "apagar", "apague", "excluir", "exclui", "deletar", "deleta", "remover", "remove", "tirar da lista", "sumir com" referindo-se a um investimento, a intenção é SEMPRE "remover_investimento" — NUNCA "editar_investimento" nem "resgatar_investimento".
+  ATENÇÃO: não confundir com "resgatar" (que tira dinheiro pro saldo). "Remover" simplesmente apaga o registro do banco.
 - "consultar_patrimonio": ver patrimônio total (saldo + investimentos - faturas) (ex: "qual meu patrimônio?", "quanto tenho no total?", "minha situação geral").
 - "dica_investimento": usuário pede dica, conselho ou orientação sobre investimentos (ex: "dica de investimento", "onde investir?", "como começar a investir?").
 - "conversa": qualquer outra coisa (saudação, dúvida, agradecimento).
@@ -2685,7 +2762,7 @@ Retorne SEMPRE este JSON:
   "cartao_nome": "<nome do cartão de crédito ou vazio>",
   "tipo_inv": "<Reserva|Renda Fixa|Ações|FIIs|Cripto|Outros ou vazio>",
   "nome_inv": "<nome do investimento (ou nome de DESTINO em transferências/edições) ou vazio>",
-  "inv_origem": "<nome ou id do investimento de ORIGEM em editar/transferir, ou vazio>",
+  "inv_origem": "<nome ou id do investimento de ORIGEM em editar/transferir/remover, ou vazio>",
   "dia_mes": <int 1-31 ou null>,
   "total_parcelas": <int ou null — pra parcelamento>,
   "fixo_id": <int ou null>,
@@ -3023,6 +3100,24 @@ def processar_mensagem(message):
                     f"R$ {valor:.2f} saiu de *{info_orig[2]}* ({info_orig[1]})\n"
                     f"➡️ Foi pra *{info_dest[2]}* ({info_dest[1]}) — agora total R$ {info_dest[3]:.2f}\n"
                     f"_Continua tudo na sua carteira de investimentos._",
+                    parse_mode="Markdown",
+                )
+
+        elif intencao == "remover_investimento":
+            origem = (dados.get("inv_origem") or dados.get("nome_inv") or "").strip()
+            if not origem:
+                bot.reply_to(message, "Pra apagar preciso saber qual investimento. Ex: 'apaga a caixinha'")
+                return
+            res = remover_investimento(user_id, origem)
+            if res is None:
+                bot.reply_to(message, f"Não achei investimento com *{origem}*.", parse_mode="Markdown")
+            else:
+                _, tipo, nome, valor = res
+                bot.reply_to(
+                    message,
+                    f"🗑️ *Investimento removido!*\n"
+                    f"{nome} ({tipo}) — R$ {valor:.2f}\n"
+                    f"_Não mexi no seu saldo._",
                     parse_mode="Markdown",
                 )
 
