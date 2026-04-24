@@ -697,9 +697,19 @@ def dica_investimento_texto(user_id):
         "- Se faltar reserva, priorize falar dela.\n"
         "- Termine com uma pergunta motivadora ou próximo passo educativo."
     )
+    # IMPORTANTE: chamada DIRETA ao Gemini, sem usar chamar_ia (que força JSON e usa histórico).
+    # Isso evita que a dica venha embrulhada em JSON e que polua a memória do chat natural.
     try:
-        resposta = chamar_ia(user_id, contexto, instr)
-        return f"💡 *Dica de investimento*\n\n{resposta}"
+        config = types.GenerateContentConfig(system_instruction=instr)
+        resposta = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=contexto,
+            config=config,
+        )
+        texto = (resposta.text or "").strip()
+        if not texto:
+            raise ValueError("resposta vazia do Gemini")
+        return f"💡 *Dica de investimento*\n\n{texto}"
     except Exception as e:
         print(f"Erro dica investimento: {e}")
         return (
