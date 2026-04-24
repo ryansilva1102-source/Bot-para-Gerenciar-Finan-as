@@ -3,6 +3,7 @@ import json
 import sqlite3
 import threading
 import time
+import calendar
 from datetime import datetime, timedelta
 
 import schedule
@@ -1064,12 +1065,97 @@ def registrar_usuario(chat_id):
 # ================= HELPERS =================
 
 def parse_valor(v):
+    """Converte qualquer coisa pra float seguro. Nunca lança exceção:
+    None, lista, dict, string maluca → 0.0. Aceita formato BR ('1.234,56')."""
+    if v is None:
+        return 0.0
+    if isinstance(v, bool):  # bool é subclasse de int, mas não é valor monetário
+        return 0.0
     if isinstance(v, (int, float)):
-        return float(v)
+        try:
+            f = float(v)
+            # NaN/Inf não fazem sentido aqui
+            if f != f or f in (float("inf"), float("-inf")):
+                return 0.0
+            return f
+        except (ValueError, TypeError, OverflowError):
+            return 0.0
     if isinstance(v, str):
-        v = v.replace("R$", "").replace(" ", "").replace(",", ".")
-        return float(v) if v else 0.0
+        s = v.strip().replace("R$", "").replace("r$", "").replace(" ", "")
+        if not s:
+            return 0.0
+        # Formato BR: "1.234,56" → "1234.56". Se tem vírgula, trata ponto como milhar.
+        if "," in s:
+            s = s.replace(".", "").replace(",", ".")
+        try:
+            f = float(s)
+            if f != f or f in (float("inf"), float("-inf")):
+                return 0.0
+            return f
+        except (ValueError, TypeError):
+            return 0.0
+    # listas, dicts, outros — fallback seguro
     return 0.0
+
+
+def _s(v, default=""):
+    """Lê campo de texto da IA de forma segura. Aceita None, lista, dict, número.
+    Retorna sempre uma string já stripada (ou default se vazio)."""
+    if v is None:
+        return default
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s else default
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        # IA às vezes devolve ["a","b"] — junta com vírgula
+        partes = [str(x).strip() for x in v if x is not None and str(x).strip()]
+        return ", ".join(partes) if partes else default
+    if isinstance(v, dict):
+        # último recurso — tenta extrair "nome"/"valor"/"texto"
+        for k in ("nome", "valor", "texto", "descricao"):
+            if k in v and v[k] is not None:
+                return _s(v[k], default)
+        return default
+    return default
+
+
+def _i(v, default=None, minimo=None, maximo=None):
+    """Lê campo inteiro da IA de forma segura. Retorna default se inválido,
+    ou None se default=None. Opcionalmente clampa em [minimo, maximo]."""
+    if v is None or isinstance(v, bool):
+        return default
+    try:
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return default
+        n = int(float(v))
+        if minimo is not None and n < minimo:
+            return default
+        if maximo is not None and n > maximo:
+            return default
+        return n
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+def _dia_clamp_no_mes(dia, ano=None, mes=None):
+    """Clampa dia pro último dia do mês corrente (ou do ano/mes informado).
+    Ex: dia=31 em fevereiro → 28 (ou 29 em ano bissexto)."""
+    hoje = datetime.now()
+    a = ano or hoje.year
+    m = mes or hoje.month
+    ult = calendar.monthrange(a, m)[1]
+    return max(1, min(int(dia), ult))
+
+
+def _ultimo_dia_do_mes(ano=None, mes=None):
+    hoje = datetime.now()
+    a = ano or hoje.year
+    m = mes or hoje.month
+    return calendar.monthrange(a, m)[1]
 
 
 def mes_atual():
@@ -1386,12 +1472,22 @@ def aplicar_receitas_fixas_do_dia():
     hoje = datetime.now()
     dia = hoje.day
     mes = hoje.strftime("%Y-%m")
+    ultimo = _ultimo_dia_do_mes(hoje.year, hoje.month)
     conn = db()
-    rows = conn.execute(
-        """SELECT id, user_id, descricao, valor, fonte FROM receitas_fixas
-           WHERE dia_mes = ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
-        (dia, mes),
-    ).fetchall()
+    # Pega receitas fixas com dia_mes = hoje. NO ÚLTIMO DIA DO MÊS, também
+    # pega as com dia_mes > último (ex: dia 31 em fev) — pra não pular o mês.
+    if dia == ultimo:
+        rows = conn.execute(
+            """SELECT id, user_id, descricao, valor, fonte FROM receitas_fixas
+               WHERE dia_mes >= ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+            (dia, mes),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT id, user_id, descricao, valor, fonte FROM receitas_fixas
+               WHERE dia_mes = ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+            (dia, mes),
+        ).fetchall()
     aplicados = 0
     for fid, user_id, desc, valor, fonte in rows:
         conn.execute(
@@ -1561,16 +1657,26 @@ def remover_gasto_fixo(user_id, fixo_id):
 
 
 def aplicar_gastos_fixos_do_dia():
-    """Aplica gastos fixos do dia para todos os usuários."""
+    """Aplica gastos fixos do dia para todos os usuários.
+    No último dia do mês, também aplica fixos cujo dia_mes excede o último
+    dia (ex: dia 31 em fevereiro), pra não pular o mês."""
     hoje = datetime.now()
     dia = hoje.day
     mes = hoje.strftime("%Y-%m")
+    ultimo = _ultimo_dia_do_mes(hoje.year, hoje.month)
     conn = db()
-    rows = conn.execute(
-        """SELECT id, user_id, descricao, valor, categoria FROM gastos_fixos
-           WHERE dia_mes = ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
-        (dia, mes),
-    ).fetchall()
+    if dia == ultimo:
+        rows = conn.execute(
+            """SELECT id, user_id, descricao, valor, categoria FROM gastos_fixos
+               WHERE dia_mes >= ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+            (dia, mes),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT id, user_id, descricao, valor, categoria FROM gastos_fixos
+               WHERE dia_mes = ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+            (dia, mes),
+        ).fetchall()
     aplicados = 0
     for fid, user_id, desc, valor, categoria in rows:
         conn.execute(
@@ -1652,14 +1758,27 @@ def aplicar_parcelamentos_do_dia(forcar_id=None):
             (forcar_id, mes),
         ).fetchall()
     else:
-        rows = conn.execute(
-            """SELECT id, user_id, descricao, valor_parcela, total_parcelas,
-                      parcelas_pagas, categoria, metodo_pagamento, cartao_id
-               FROM parcelamentos
-               WHERE dia_cobranca = ? AND parcelas_pagas < total_parcelas
-                 AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
-            (dia, mes),
-        ).fetchall()
+        # No último dia do mês, também pega parcelas com dia_cobranca > último
+        # (ex: parcela todo dia 31 em fevereiro) — pra não pular a cobrança.
+        ultimo = _ultimo_dia_do_mes(hoje.year, hoje.month)
+        if dia == ultimo:
+            rows = conn.execute(
+                """SELECT id, user_id, descricao, valor_parcela, total_parcelas,
+                          parcelas_pagas, categoria, metodo_pagamento, cartao_id
+                   FROM parcelamentos
+                   WHERE dia_cobranca >= ? AND parcelas_pagas < total_parcelas
+                     AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+                (dia, mes),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id, user_id, descricao, valor_parcela, total_parcelas,
+                          parcelas_pagas, categoria, metodo_pagamento, cartao_id
+                   FROM parcelamentos
+                   WHERE dia_cobranca = ? AND parcelas_pagas < total_parcelas
+                     AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+                (dia, mes),
+            ).fetchall()
     aplicados = 0
     for pid, user_id, desc, vp, total, pagas, cat, metodo, cartao_id in rows:
         nova = pagas + 1
@@ -3473,8 +3592,18 @@ def processar_mensagem(message):
 
         resposta_ia = chamar_ia(user_id, texto_usuario, SYSTEM_INSTRUCTION)
         print(f"[{user_id}] IA: {resposta_ia.text}")
-        dados = json.loads(resposta_ia.text)
-        intencao = dados.get("intencao", "conversa")
+        try:
+            dados = json.loads(resposta_ia.text)
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            print(f"[{user_id}] JSON inválido da IA: {e}")
+            bot.reply_to(message, "Não entendi sua resposta. Pode reformular?")
+            return
+        # Defensiva: se a IA retornar lista/string em vez de dict, recupera
+        if not isinstance(dados, dict):
+            print(f"[{user_id}] IA retornou tipo inesperado: {type(dados).__name__}")
+            bot.reply_to(message, "Não entendi sua resposta. Pode reformular?")
+            return
+        intencao = _s(dados.get("intencao"), default="conversa") or "conversa"
 
         # ===== Confirmar/Cancelar via intenção da IA =====
         if intencao == "confirmar":
@@ -3550,21 +3679,21 @@ def processar_mensagem(message):
             if cartao_nome:
                 cartao = buscar_cartao(user_id, nome=cartao_nome)
                 if not cartao:
-                    nomes = ", ".join(c[1] for c in cartoes)
+                    nomes = ", ".join(escape_md(c[1]) for c in cartoes)
                     bot.reply_to(
                         message,
-                        f"Não achei o cartão *{cartao_nome}*. Cartões cadastrados: {nomes}",
+                        f"Não achei o cartão *{escape_md(cartao_nome)}*. Cartões cadastrados: {nomes}",
                         parse_mode="Markdown",
                     )
                     return
             elif len(cartoes) == 1:
                 cartao = cartoes[0]
             else:
-                nomes = ", ".join(c[1] for c in cartoes)
+                nomes = ", ".join(escape_md(c[1]) for c in cartoes)
                 bot.reply_to(
                     message,
                     f"Você tem mais de um cartão. Em qual lançar? ({nomes})\n"
-                    f"Tenta: 'gastei {valor:.0f} no crédito {cartoes[0][1]}'",
+                    f"Tenta: 'gastei {valor:.0f} no crédito {escape_md(cartoes[0][1])}'",
                     parse_mode="Markdown",
                 )
                 return
@@ -3600,30 +3729,31 @@ def processar_mensagem(message):
             verificar_alerta_limite(user_id, cid)
 
         elif intencao == "consultar_fatura":
-            cartao_nome = (dados.get("cartao_nome") or "").strip()
+            cartao_nome = _s(dados.get("cartao_nome"))
             cartoes = listar_cartoes(user_id)
             if not cartoes:
                 bot.reply_to(message, "Você não tem cartões cadastrados.")
                 return
+            cartao = None
             if cartao_nome:
                 cartao = buscar_cartao(user_id, nome=cartao_nome)
             elif len(cartoes) == 1:
                 cartao = cartoes[0]
             else:
-                nomes = ", ".join(c[1] for c in cartoes)
+                nomes = ", ".join(escape_md(c[1]) for c in cartoes)
                 bot.reply_to(message, f"De qual cartão? ({nomes})\nUse: `/fatura <nome>`", parse_mode="Markdown")
                 return
             if not cartao:
-                bot.reply_to(message, f"Cartão *{cartao_nome}* não encontrado.", parse_mode="Markdown")
+                bot.reply_to(message, f"Cartão *{escape_md(cartao_nome)}* não encontrado.", parse_mode="Markdown")
                 return
             cid, nome, _, _, dia_venc = cartao
             rows, total = fatura_aberta(user_id, cid)
             if not rows:
-                bot.reply_to(message, f"💳 *{nome}*: nenhuma fatura aberta. ✨", parse_mode="Markdown")
+                bot.reply_to(message, f"💳 *{escape_md(nome)}*: nenhuma fatura aberta. ✨", parse_mode="Markdown")
                 return
             venc = proxima_data_vencimento(dia_venc)
             texto = (
-                f"💳 *Fatura {nome}*\n"
+                f"💳 *Fatura {escape_md(nome)}*\n"
                 f"📅 Vence em: {venc.strftime('%d/%m/%Y')}\n"
                 f"💸 Total: *R$ {total:.2f}*\n\n*Lançamentos:*"
             )
@@ -3631,36 +3761,37 @@ def processar_mensagem(message):
                 try:
                     d = datetime.strptime(data[:10], "%Y-%m-%d").strftime("%d/%m")
                 except Exception:
-                    d = data[:10]
-                texto += f"\n• {d} | R$ {valor:.2f} | {cat or '—'}{(' — ' + desc) if desc else ''}"
+                    d = (data or "")[:10]
+                texto += f"\n• {d} | R$ {valor:.2f} | {escape_md(cat or '—')}{(' — ' + escape_md(desc)) if desc else ''}"
             if len(rows) > 25:
                 texto += f"\n_(+{len(rows) - 25} lançamentos)_"
             bot.reply_to(message, texto, parse_mode="Markdown")
 
         elif intencao == "pagar_fatura":
-            cartao_nome = (dados.get("cartao_nome") or "").strip()
+            cartao_nome = _s(dados.get("cartao_nome"))
             cartoes = listar_cartoes(user_id)
             if not cartoes:
                 bot.reply_to(message, "Você não tem cartões cadastrados.")
                 return
+            cartao = None
             if cartao_nome:
                 cartao = buscar_cartao(user_id, nome=cartao_nome)
             elif len(cartoes) == 1:
                 cartao = cartoes[0]
             else:
-                nomes = ", ".join(c[1] for c in cartoes)
+                nomes = ", ".join(escape_md(c[1]) for c in cartoes)
                 bot.reply_to(message, f"Qual cartão? ({nomes})\nUse: `/pagar_fatura <nome>`", parse_mode="Markdown")
                 return
             if not cartao:
-                bot.reply_to(message, f"Cartão *{cartao_nome}* não encontrado.", parse_mode="Markdown")
+                bot.reply_to(message, f"Cartão *{escape_md(cartao_nome)}* não encontrado.", parse_mode="Markdown")
                 return
             n, total = pagar_fatura(user_id, cartao[0])
             if n == 0:
-                bot.reply_to(message, f"Não tinha fatura aberta no *{cartao[1]}*.", parse_mode="Markdown")
+                bot.reply_to(message, f"Não tinha fatura aberta no *{escape_md(cartao[1])}*.", parse_mode="Markdown")
             else:
                 bot.reply_to(
                     message,
-                    f"✅ Fatura do *{cartao[1]}* paga!\n💸 R$ {total:.2f} ({n} lançamentos)",
+                    f"✅ Fatura do *{escape_md(cartao[1])}* paga!\n💸 R$ {total:.2f} ({n} lançamentos)",
                     parse_mode="Markdown",
                 )
 
@@ -3695,28 +3826,28 @@ def processar_mensagem(message):
                 return
             resgatado = resgatar_investimento(user_id, nome, valor, tipo_hint)
             if resgatado is None:
-                ref = nome or tipo_hint
-                bot.reply_to(message, f"Não achei investimento ativo com *{ref}*.", parse_mode="Markdown")
+                ref = nome or tipo_hint or ""
+                bot.reply_to(message, f"Não achei investimento ativo com *{escape_md(ref)}*.", parse_mode="Markdown")
             elif isinstance(resgatado, tuple) and resgatado[0] == "varios_no_tipo":
                 _, tipo_norm, lista = resgatado
-                opcoes = "\n".join(f"• #{i} — {n} (R$ {v:.2f})" for i, n, v in lista)
+                opcoes = "\n".join(f"• #{i} — {escape_md(n)} (R$ {v:.2f})" for i, n, v in lista)
                 bot.reply_to(
                     message,
-                    f"🤔 Você tem mais de um investimento em *{tipo_norm}*. Qual?\n{opcoes}\n\nResponde com o nome ou o id (ex: 'resgatei {valor:.0f} do #{lista[0][0]}').",
+                    f"🤔 Você tem mais de um investimento em *{escape_md(tipo_norm)}*. Qual?\n{opcoes}\n\nResponde com o nome ou o id (ex: 'resgatei {valor:.0f} do #{lista[0][0]}').",
                     parse_mode="Markdown",
                 )
             else:
                 valor_resg, nome_real = resgatado
                 bot.reply_to(
                     message,
-                    f"💸 Resgatado: R$ {valor_resg:.2f} de *{nome_real}*\n📥 Lancei como receita.",
+                    f"💸 Resgatado: R$ {valor_resg:.2f} de *{escape_md(nome_real)}*\n📥 Lancei como receita.",
                     parse_mode="Markdown",
                 )
 
         elif intencao == "aportar_investimento":
-            origem = (dados.get("inv_origem") or dados.get("nome_inv") or "").strip()
+            origem = _s(dados.get("inv_origem")) or _s(dados.get("nome_inv"))
             valor = parse_valor(dados.get("valor"))
-            tipo = (dados.get("tipo_inv") or "").strip()
+            tipo = _s(dados.get("tipo_inv"))
             if not origem or valor <= 0:
                 bot.reply_to(
                     message,
@@ -3752,12 +3883,12 @@ def processar_mensagem(message):
                 )
 
         elif intencao == "editar_investimento":
-            origem = (dados.get("inv_origem") or "").strip()
+            origem = _s(dados.get("inv_origem"))
             if not origem:
                 bot.reply_to(message, "Pra editar preciso saber qual investimento. Ex: 'muda a caixinha pra reserva de emergência'")
                 return
-            novo_nome = (dados.get("nome_inv") or "").strip() or None
-            novo_tipo = (dados.get("tipo_inv") or "").strip() or None
+            novo_nome = _s(dados.get("nome_inv")) or None
+            novo_tipo = _s(dados.get("tipo_inv")) or None
             # CRÍTICO: precisa diferenciar None ("não falou de valor") de 0 ("zere")
             valor_raw = dados.get("valor")
             if valor_raw is None:
@@ -3768,7 +3899,7 @@ def processar_mensagem(message):
                     novo_valor = None
             res = editar_investimento(user_id, origem, novo_nome, novo_tipo, novo_valor)
             if res is None:
-                bot.reply_to(message, f"Não achei investimento ativo com *{origem}*.", parse_mode="Markdown")
+                bot.reply_to(message, f"Não achei investimento ativo com *{escape_md(origem)}*.", parse_mode="Markdown")
             elif res[0] == "nada":
                 bot.reply_to(message, "Nada pra mudar — os valores são iguais aos atuais.")
             else:
@@ -3776,26 +3907,26 @@ def processar_mensagem(message):
                 bot.reply_to(
                     message,
                     f"✏️ *Investimento atualizado!*\n"
-                    f"De: {ant[2]} ({ant[1]}) — R$ {ant[3]:.2f}\n"
-                    f"Para: *{atu[2]}* ({atu[1]}) — R$ {atu[3]:.2f}",
+                    f"De: {escape_md(ant[2])} ({escape_md(ant[1])}) — R$ {ant[3]:.2f}\n"
+                    f"Para: *{escape_md(atu[2])}* ({escape_md(atu[1])}) — R$ {atu[3]:.2f}",
                     parse_mode="Markdown",
                 )
 
         elif intencao == "transferir_investimento":
             valor = parse_valor(dados.get("valor"))
-            origem = (dados.get("inv_origem") or "").strip()
-            destino = (dados.get("nome_inv") or "").strip()
-            tipo_destino = (dados.get("tipo_inv") or "").strip() or None
+            origem = _s(dados.get("inv_origem"))
+            destino = _s(dados.get("nome_inv"))
+            tipo_destino = _s(dados.get("tipo_inv")) or None
             if valor <= 0 or not origem or not destino:
                 bot.reply_to(message, "Pra transferir preciso do valor, da origem e do destino.\nEx: 'passa 500 da caixinha pra reserva de emergência'")
                 return
             status, info_orig, info_dest = transferir_investimento(user_id, origem, destino, valor, tipo_destino)
             if status == "origem_nao_encontrada":
-                bot.reply_to(message, f"Não achei investimento ativo chamado *{origem}*.", parse_mode="Markdown")
+                bot.reply_to(message, f"Não achei investimento ativo chamado *{escape_md(origem)}*.", parse_mode="Markdown")
             elif status == "saldo_insuficiente":
                 bot.reply_to(
                     message,
-                    f"💸 Saldo insuficiente em *{info_orig[2]}* (você tem R$ {info_orig[3]:.2f}).",
+                    f"💸 Saldo insuficiente em *{escape_md(info_orig[2])}* (você tem R$ {info_orig[3]:.2f}).",
                     parse_mode="Markdown",
                 )
             elif status == "valor_invalido":
@@ -3804,26 +3935,26 @@ def processar_mensagem(message):
                 bot.reply_to(
                     message,
                     f"🔄 *Transferência feita!*\n"
-                    f"R$ {valor:.2f} saiu de *{info_orig[2]}* ({info_orig[1]})\n"
-                    f"➡️ Foi pra *{info_dest[2]}* ({info_dest[1]}) — agora total R$ {info_dest[3]:.2f}\n"
+                    f"R$ {valor:.2f} saiu de *{escape_md(info_orig[2])}* ({escape_md(info_orig[1])})\n"
+                    f"➡️ Foi pra *{escape_md(info_dest[2])}* ({escape_md(info_dest[1])}) — agora total R$ {info_dest[3]:.2f}\n"
                     f"_Continua tudo na sua carteira de investimentos._",
                     parse_mode="Markdown",
                 )
 
         elif intencao == "remover_investimento":
-            origem = (dados.get("inv_origem") or dados.get("nome_inv") or "").strip()
+            origem = _s(dados.get("inv_origem")) or _s(dados.get("nome_inv"))
             if not origem:
                 bot.reply_to(message, "Pra apagar preciso saber qual investimento. Ex: 'apaga a caixinha'")
                 return
             res = remover_investimento(user_id, origem)
             if res is None:
-                bot.reply_to(message, f"Não achei investimento com *{origem}*.", parse_mode="Markdown")
+                bot.reply_to(message, f"Não achei investimento com *{escape_md(origem)}*.", parse_mode="Markdown")
             else:
                 _, tipo, nome, valor = res
                 bot.reply_to(
                     message,
                     f"🗑️ *Investimento removido!*\n"
-                    f"{nome} ({tipo}) — R$ {valor:.2f}\n"
+                    f"{escape_md(nome)} ({escape_md(tipo)}) — R$ {valor:.2f}\n"
                     f"_Não mexi no seu saldo._",
                     parse_mode="Markdown",
                 )
@@ -3836,18 +3967,14 @@ def processar_mensagem(message):
 
         elif intencao == "adicionar_receita_fixa":
             valor = parse_valor(dados.get("valor"))
-            dia = dados.get("dia_mes")
-            descricao = (dados.get("descricao") or "Receita Fixa").strip()
-            fonte = (dados.get("fonte") or dados.get("categoria") or "Salário").strip()
-            if valor <= 0 or not dia:
-                bot.reply_to(message, "Para cadastrar uma receita fixa preciso do valor e do dia do mês. Ex: 'recebo 828 todo dia 15'.")
+            dia = _i(dados.get("dia_mes"), default=None, minimo=1, maximo=31)
+            descricao = _s(dados.get("descricao"), default="Receita Fixa")
+            fonte = _s(dados.get("fonte")) or _s(dados.get("categoria")) or "Salário"
+            if valor <= 0:
+                bot.reply_to(message, "Qual o valor da receita fixa? Ex: 'recebo 828 todo dia 15'.")
                 return
-            try:
-                dia = int(dia)
-                if dia < 1 or dia > 31:
-                    raise ValueError
-            except (ValueError, TypeError):
-                bot.reply_to(message, "Dia do mês inválido (precisa ser entre 1 e 31).")
+            if dia is None:
+                bot.reply_to(message, "Em qual dia do mês você recebe? (1-31). Ex: 'recebo 828 todo dia 15'.")
                 return
             adicionar_receita_fixa(user_id, descricao, valor, fonte, dia)
             bot.reply_to(
@@ -3867,11 +3994,11 @@ def processar_mensagem(message):
                 bot.reply_to(message, texto, parse_mode="Markdown")
 
         elif intencao == "remover_receita_fixa":
-            fid = dados.get("fixo_id")
-            if not fid:
+            fid = _i(dados.get("fixo_id"), default=None, minimo=1)
+            if fid is None:
                 bot.reply_to(message, "Qual receita fixa? Diga 'listar receitas fixas' pra ver os IDs.")
                 return
-            n = remover_receita_fixa(user_id, int(fid))
+            n = remover_receita_fixa(user_id, fid)
             bot.reply_to(message, f"🗑️ Receita automática #{fid} removida." if n else f"Não encontrei a receita #{fid}.")
         elif intencao == "registrar_receita":
             valor = parse_valor(dados.get("valor"))
@@ -3979,18 +4106,14 @@ def processar_mensagem(message):
 
         elif intencao == "adicionar_gasto_fixo":
             valor = parse_valor(dados.get("valor"))
-            dia = dados.get("dia_mes")
-            descricao = (dados.get("descricao") or "").strip()
-            categoria = (dados.get("categoria") or "Fixo").strip() or "Fixo"
-            if valor <= 0 or not dia or not descricao:
+            dia = _i(dados.get("dia_mes"), default=None, minimo=1, maximo=31)
+            descricao = _s(dados.get("descricao"))
+            categoria = _s(dados.get("categoria"), default="Fixo") or "Fixo"
+            if valor <= 0 or not descricao:
                 bot.reply_to(message, "Pra cadastrar um gasto fixo preciso de: descrição, valor e dia do mês. Ex: 'aluguel 1200 todo dia 5'.")
                 return
-            try:
-                dia = int(dia)
-                if dia < 1 or dia > 31:
-                    raise ValueError
-            except (ValueError, TypeError):
-                bot.reply_to(message, "Dia do mês inválido (precisa ser entre 1 e 31).")
+            if dia is None:
+                bot.reply_to(message, "Em qual dia do mês esse gasto cai? (1-31).")
                 return
             adicionar_gasto_fixo(user_id, descricao, valor, categoria, dia)
             bot.reply_to(
@@ -4002,11 +4125,11 @@ def processar_mensagem(message):
             comando_fixos(message)
 
         elif intencao == "remover_gasto_fixo":
-            fid = dados.get("fixo_id")
-            if not fid:
+            fid = _i(dados.get("fixo_id"), default=None, minimo=1)
+            if fid is None:
                 bot.reply_to(message, "Qual gasto fixo? Use /fixos pra ver os IDs e diga 'remove gasto fixo #2'.")
                 return
-            n = remover_gasto_fixo(user_id, int(fid))
+            n = remover_gasto_fixo(user_id, fid)
             bot.reply_to(message, f"🗑️ Gasto fixo #{fid} removido." if n else f"Não encontrei o gasto fixo #{fid}.")
 
         elif intencao == "consultar_relatorio":
@@ -4034,22 +4157,14 @@ def processar_mensagem(message):
 
         elif intencao == "adicionar_parcelamento":
             valor_total = parse_valor(dados.get("valor"))
-            total_parcelas = dados.get("total_parcelas")
-            descricao = (dados.get("descricao") or "").strip()
-            categoria = (dados.get("categoria") or "Outros").strip() or "Outros"
+            total_parcelas = _i(dados.get("total_parcelas"), default=None, minimo=1, maximo=120)
+            descricao = _s(dados.get("descricao"))
+            categoria = _s(dados.get("categoria"), default="Outros") or "Outros"
             metodo = normalizar_metodo(dados.get("metodo_pagamento")) or "Crédito"
-            dia = dados.get("dia_mes") or 10
-            cartao_nome = (dados.get("cartao_nome") or "").strip()
-            if valor_total <= 0 or not total_parcelas or not descricao:
+            dia = _i(dados.get("dia_mes"), default=10, minimo=1, maximo=31)
+            cartao_nome = _s(dados.get("cartao_nome"))
+            if valor_total <= 0 or total_parcelas is None or not descricao:
                 bot.reply_to(message, "Pra cadastrar um parcelamento preciso de: descrição, valor total e número de parcelas. Ex: 'comprei celular 1200 em 12x'.")
-                return
-            try:
-                total_parcelas = int(total_parcelas)
-                dia = int(dia)
-                if total_parcelas < 1 or dia < 1 or dia > 31:
-                    raise ValueError
-            except (ValueError, TypeError):
-                bot.reply_to(message, "Número de parcelas ou dia inválido.")
                 return
 
             # Se é parcelamento no crédito, tenta vincular ao cartão pra contar fatura/limite
@@ -4095,11 +4210,11 @@ def processar_mensagem(message):
                 bot.reply_to(message, texto, parse_mode="Markdown")
 
         elif intencao == "remover_parcelamento":
-            pid = dados.get("parc_id")
-            if not pid:
+            pid = _i(dados.get("parc_id"), default=None, minimo=1)
+            if pid is None:
                 bot.reply_to(message, "Qual parcelamento? Diga 'meus parcelamentos' pra ver os IDs.")
                 return
-            n = remover_parcelamento(user_id, int(pid))
+            n = remover_parcelamento(user_id, pid)
             bot.reply_to(message, f"🗑️ Parcelamento #{pid} cancelado." if n else f"Não encontrei o parcelamento #{pid}.")
 
         elif intencao == "buscar_gastos":
@@ -4130,10 +4245,10 @@ def processar_mensagem(message):
                     try:
                         dia = datetime.strptime(data, "%Y-%m-%d %H:%M:%S").strftime("%d/%m")
                     except Exception:
-                        dia = data
-                    d = f" — {desc}" if desc else ""
-                    m = f" [{metodo}]" if metodo else ""
-                    texto += f"\n• {dia} | R$ {valor:.2f} | {cat}{d}{m}"
+                        dia = (data or "")[:10]
+                    d = f" — {escape_md(desc)}" if desc else ""
+                    m = f" [{escape_md(metodo)}]" if metodo else ""
+                    texto += f"\n• {dia} | R$ {valor:.2f} | {escape_md(cat or '—')}{d}{m}"
                 if len(rows) > 20:
                     texto += f"\n\n_(mostrando 20 de {len(rows)})_"
                 bot.reply_to(message, texto, parse_mode="Markdown")
@@ -4411,6 +4526,10 @@ def processar_mensagem(message):
                 dia = datetime.now().strftime("%Y-%m-%d")
             elif dia_relativo == "ontem":
                 dia = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            elif dia_relativo in ("anteontem", "ante-ontem"):
+                dia = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+            elif dia_relativo in ("amanhã", "amanha"):
+                dia = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
             elif dia_mes_num:
                 # Usuário disse "dia 15" — assume mês/ano atual.
                 # CUIDADO: dia 31 em fev quebra. Clamp pro último dia do mês.
