@@ -23,7 +23,7 @@ MODEL_FALLBACK = "gemini-2.5-flash"
 
 # Versão da SYSTEM_INSTRUCTION. Bump esse número sempre que o prompt mudar
 # pra invalidar sessões já abertas e o Gemini reler o prompt novo.
-SYSTEM_INSTRUCTION_VERSION = "v2"
+SYSTEM_INSTRUCTION_VERSION = "v3"
 
 # user_id -> (versao_prompt, chat_session)
 memoria_usuarios = {}
@@ -251,6 +251,19 @@ def criar_banco():
         )
     """)
 
+    # Contas bancárias: usuário pode separar dinheiro por banco (Nubank, Itaú, etc.)
+    # Lançamentos sem conta_id = "Geral" (pilha sem conta específica).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS contas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            nome TEXT NOT NULL,
+            banco TEXT,
+            tipo TEXT,
+            criado_em TEXT NOT NULL
+        )
+    """)
+
     # Migração: adicionar user_id em tabelas antigas, se faltar
     for tbl in ("gastos", "receitas", "gastos_fixos"):
         if not _column_exists(cursor, tbl, "user_id"):
@@ -267,6 +280,18 @@ def criar_banco():
     # Migração: vincular parcelamento a um cartão de crédito (opcional)
     if _table_exists(cursor, "parcelamentos") and not _column_exists(cursor, "parcelamentos", "cartao_id"):
         cursor.execute("ALTER TABLE parcelamentos ADD COLUMN cartao_id INTEGER")
+
+    # Migração MULTI-CONTA: adiciona conta_id (NULL = sem conta específica = Geral)
+    # em todas as tabelas de movimentação. Nada se quebra: dados antigos ficam
+    # com conta_id NULL e seguem aparecendo no relatório geral.
+    for tbl in ("gastos", "receitas", "gastos_fixos", "receitas_fixas",
+                "parcelamentos", "investimentos", "gastos_cartao"):
+        if _table_exists(cursor, tbl) and not _column_exists(cursor, tbl, "conta_id"):
+            cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN conta_id INTEGER")
+    # Cartão de crédito tem uma conta de PAGAMENTO (de onde sai o dinheiro
+    # quando paga a fatura). Pode ser NULL (paga genericamente).
+    if not _column_exists(cursor, "cartoes_credito", "conta_id_pagamento"):
+        cursor.execute("ALTER TABLE cartoes_credito ADD COLUMN conta_id_pagamento INTEGER")
 
     # orcamentos e metas precisam de chave composta (user_id, mes)
     # Recria se não tiver user_id
@@ -398,17 +423,29 @@ def contar_feedbacks_nao_lidos():
 
 # ================= CARTÕES DE CRÉDITO =================
 
-def criar_cartao(user_id, nome, limite, dia_fechamento, dia_vencimento):
+def criar_cartao(user_id, nome, limite, dia_fechamento, dia_vencimento, conta_id_pagamento=None):
     conn = db()
     cur = conn.execute(
-        "INSERT INTO cartoes_credito (user_id, nome, limite, dia_fechamento, dia_vencimento, criado_em) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, nome, limite, dia_fechamento, dia_vencimento, datetime.now().isoformat()),
+        "INSERT INTO cartoes_credito (user_id, nome, limite, dia_fechamento, dia_vencimento, criado_em, conta_id_pagamento) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, nome, limite, dia_fechamento, dia_vencimento, datetime.now().isoformat(), conta_id_pagamento),
     )
     cid = cur.lastrowid
     conn.commit()
     conn.close()
     return cid
+
+
+def vincular_cartao_a_conta(user_id, cartao_id, conta_id):
+    """Define qual conta paga a fatura desse cartão. Pode passar None pra desvincular."""
+    conn = db()
+    n = conn.execute(
+        "UPDATE cartoes_credito SET conta_id_pagamento = ? WHERE user_id = ? AND id = ?",
+        (conta_id, user_id, cartao_id),
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return n
 
 
 def listar_cartoes(user_id):
@@ -473,19 +510,22 @@ def calcular_fatura_mes(data_compra, dia_fechamento):
 
 
 def registrar_gasto_cartao(user_id, cartao_id, valor, categoria, descricao, data=None):
+    """Registra compra no cartão. A conta_id é HERDADA do cartão (campo
+    conta_id_pagamento) — então a fatura sai sempre da mesma conta."""
     conn = db()
     data = data or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cartao = conn.execute(
-        "SELECT dia_fechamento FROM cartoes_credito WHERE id = ?", (cartao_id,)
+        "SELECT dia_fechamento, conta_id_pagamento FROM cartoes_credito WHERE id = ?", (cartao_id,)
     ).fetchone()
     if not cartao:
         conn.close()
         return None
     fatura_mes = calcular_fatura_mes(data[:10], cartao[0])
+    conta_id = cartao[1]
     cur = conn.execute(
-        "INSERT INTO gastos_cartao (user_id, cartao_id, valor, categoria, descricao, data, fatura_mes) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (user_id, cartao_id, valor, categoria, descricao, data, fatura_mes),
+        "INSERT INTO gastos_cartao (user_id, cartao_id, valor, categoria, descricao, data, fatura_mes, conta_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, cartao_id, valor, categoria, descricao, data, fatura_mes, conta_id),
     )
     gid = cur.lastrowid
     conn.commit()
@@ -524,13 +564,20 @@ def total_fatura_aberta_todos_cartoes(user_id):
     return total or 0
 
 
-def pagar_fatura(user_id, cartao_id, fatura_mes=None):
-    """Marca todos os gastos da fatura como pagos e cria 1 gasto consolidado."""
+def pagar_fatura(user_id, cartao_id, fatura_mes=None, conta_id_pagamento=None):
+    """Marca todos os gastos da fatura como pagos e cria 1 gasto consolidado.
+    O gasto consolidado sai da conta_id_pagamento (parâmetro) ou, se não
+    informado, da conta_id_pagamento padrão do cartão."""
     rows, total = fatura_aberta(user_id, cartao_id, fatura_mes)
     if not rows:
         return 0, 0
-    cartao = buscar_cartao(user_id, cartao_id=cartao_id)
-    nome_cartao = cartao[1] if cartao else "Cartão"
+    cartao_info = db().execute(
+        "SELECT nome, conta_id_pagamento FROM cartoes_credito WHERE user_id = ? AND id = ?",
+        (user_id, cartao_id),
+    ).fetchone()
+    nome_cartao = cartao_info[0] if cartao_info else "Cartão"
+    if conta_id_pagamento is None and cartao_info:
+        conta_id_pagamento = cartao_info[1]
     conn = db()
     agora = datetime.now().isoformat()
     if fatura_mes:
@@ -547,9 +594,10 @@ def pagar_fatura(user_id, cartao_id, fatura_mes=None):
         )
     desc = f"Fatura {fatura_mes or 'aberta'} - {nome_cartao}"
     conn.execute(
-        "INSERT INTO gastos (user_id, valor, categoria, descricao, data, metodo_pagamento) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, total, "Cartão de Crédito", desc, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Crédito"),
+        "INSERT INTO gastos (user_id, valor, categoria, descricao, data, metodo_pagamento, conta_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, total, "Cartão de Crédito", desc,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Crédito", conta_id_pagamento),
     )
     conn.commit()
     conn.close()
@@ -588,6 +636,252 @@ def proxima_data_vencimento(dia_vencimento, hoje=None):
     return venc
 
 
+# ================= CONTAS BANCÁRIAS =================
+#
+# Cada usuário pode cadastrar contas (Nubank, Itaú, etc.) e tagear gastos/
+# receitas/fixos/parcelamentos/investimentos com a conta de origem. Lançamentos
+# sem conta_id (NULL) são "Geral" — entram no relatório consolidado mas não
+# aparecem em relatórios filtrados por conta. Isso preserva 100% dos dados
+# antigos (todos eles têm conta_id NULL).
+
+TIPOS_CONTA = ["Corrente", "Poupança", "Digital", "Salário", "Dinheiro", "Outro"]
+
+
+def normalizar_tipo_conta(t):
+    if not t:
+        return "Corrente"
+    t = _s(t).strip().lower()
+    mapa = {
+        "corrente": "Corrente", "cc": "Corrente", "conta corrente": "Corrente",
+        "poupanca": "Poupança", "poupança": "Poupança", "savings": "Poupança",
+        "digital": "Digital", "fintech": "Digital", "neobank": "Digital",
+        "salario": "Salário", "salário": "Salário",
+        "dinheiro": "Dinheiro", "cash": "Dinheiro", "espécie": "Dinheiro", "especie": "Dinheiro",
+        "outro": "Outro", "outros": "Outro",
+    }
+    return mapa.get(t, t.title())
+
+
+def criar_conta(user_id, nome, banco=None, tipo=None):
+    nome = _s(nome).strip()
+    banco = _s(banco).strip() or None
+    tipo = normalizar_tipo_conta(tipo)
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO contas (user_id, nome, banco, tipo, criado_em) VALUES (?, ?, ?, ?, ?)",
+        (user_id, nome, banco, tipo, datetime.now().isoformat()),
+    )
+    cid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return cid
+
+
+def listar_contas(user_id):
+    """Retorna lista de tuplas (id, nome, banco, tipo, criado_em)."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, nome, banco, tipo, criado_em FROM contas WHERE user_id = ? ORDER BY nome",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def buscar_conta(user_id, nome=None, conta_id=None):
+    """Busca conta por id (preferencial) ou por nome (case-insensitive, exato).
+    Se nome não bater exato, tenta sub-string única (ex: 'nu' acha 'Nubank')."""
+    conn = db()
+    if conta_id:
+        row = conn.execute(
+            "SELECT id, nome, banco, tipo, criado_em FROM contas WHERE user_id = ? AND id = ?",
+            (user_id, conta_id),
+        ).fetchone()
+        conn.close()
+        return row
+    nome = _s(nome).strip()
+    if not nome:
+        conn.close()
+        return None
+    # 1) match exato (case-insensitive)
+    row = conn.execute(
+        "SELECT id, nome, banco, tipo, criado_em FROM contas "
+        "WHERE user_id = ? AND LOWER(nome) = LOWER(?)",
+        (user_id, nome),
+    ).fetchone()
+    if row:
+        conn.close()
+        return row
+    # 2) match por banco exato
+    row = conn.execute(
+        "SELECT id, nome, banco, tipo, criado_em FROM contas "
+        "WHERE user_id = ? AND LOWER(COALESCE(banco,'')) = LOWER(?)",
+        (user_id, nome),
+    ).fetchone()
+    if row:
+        conn.close()
+        return row
+    # 3) sub-string única (ex: 'nu' acha só 'Nubank' se for o único que contém 'nu')
+    rows = conn.execute(
+        "SELECT id, nome, banco, tipo, criado_em FROM contas "
+        "WHERE user_id = ? AND (LOWER(nome) LIKE LOWER(?) OR LOWER(COALESCE(banco,'')) LIKE LOWER(?))",
+        (user_id, f"%{nome}%", f"%{nome}%"),
+    ).fetchall()
+    conn.close()
+    if len(rows) == 1:
+        return rows[0]
+    return None  # zero matches OU ambíguo (>1)
+
+
+def renomear_conta(user_id, conta_id, novo_nome=None, novo_banco=None, novo_tipo=None):
+    sets = []
+    vals = []
+    if novo_nome:
+        sets.append("nome = ?")
+        vals.append(_s(novo_nome).strip())
+    if novo_banco is not None:  # permite "" pra limpar
+        sets.append("banco = ?")
+        vals.append(_s(novo_banco).strip() or None)
+    if novo_tipo:
+        sets.append("tipo = ?")
+        vals.append(normalizar_tipo_conta(novo_tipo))
+    if not sets:
+        return 0
+    vals.extend([user_id, conta_id])
+    conn = db()
+    n = conn.execute(
+        f"UPDATE contas SET {', '.join(sets)} WHERE user_id = ? AND id = ?", vals
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def remover_conta(user_id, conta_id, transferir_para=None):
+    """Remove conta. Por padrão, lançamentos vinculados ficam órfãos (conta_id=NULL,
+    voltam para a pilha 'Geral'). Se transferir_para for outro conta_id, remarca
+    todos os lançamentos pra essa conta antes de deletar."""
+    conn = db()
+    if transferir_para:
+        for tbl in ("gastos", "receitas", "gastos_fixos", "receitas_fixas",
+                    "parcelamentos", "investimentos", "gastos_cartao"):
+            conn.execute(
+                f"UPDATE {tbl} SET conta_id = ? WHERE user_id = ? AND conta_id = ?",
+                (transferir_para, user_id, conta_id),
+            )
+        conn.execute(
+            "UPDATE cartoes_credito SET conta_id_pagamento = ? "
+            "WHERE user_id = ? AND conta_id_pagamento = ?",
+            (transferir_para, user_id, conta_id),
+        )
+    else:
+        for tbl in ("gastos", "receitas", "gastos_fixos", "receitas_fixas",
+                    "parcelamentos", "investimentos", "gastos_cartao"):
+            conn.execute(
+                f"UPDATE {tbl} SET conta_id = NULL WHERE user_id = ? AND conta_id = ?",
+                (user_id, conta_id),
+            )
+        conn.execute(
+            "UPDATE cartoes_credito SET conta_id_pagamento = NULL "
+            "WHERE user_id = ? AND conta_id_pagamento = ?",
+            (user_id, conta_id),
+        )
+    n = conn.execute(
+        "DELETE FROM contas WHERE user_id = ? AND id = ?", (user_id, conta_id)
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def contar_lancamentos_conta(user_id, conta_id):
+    """Conta quantos lançamentos (de qualquer tipo) estão na conta — pra avisar
+    o usuário antes de remover."""
+    conn = db()
+    total = 0
+    for tbl in ("gastos", "receitas", "gastos_fixos", "receitas_fixas",
+                "parcelamentos", "investimentos", "gastos_cartao"):
+        total += conn.execute(
+            f"SELECT COUNT(*) FROM {tbl} WHERE user_id = ? AND conta_id = ?",
+            (user_id, conta_id),
+        ).fetchone()[0]
+    conn.close()
+    return total
+
+
+def total_gasto_mes_conta(user_id, conta_id, mes=None):
+    """Total de gastos do mês para uma conta específica (ou todas se conta_id=None)."""
+    return total_gasto_mes(user_id, mes=mes, conta_id=conta_id)
+
+
+def total_receita_mes_conta(user_id, conta_id, mes=None):
+    return total_receita_mes(user_id, mes=mes, conta_id=conta_id)
+
+
+def saldo_conta(user_id, conta_id, mes=None):
+    """Saldo do MÊS para uma conta (receitas - gastos do mês). conta_id=None = total geral."""
+    return total_receita_mes(user_id, mes=mes, conta_id=conta_id) - \
+           total_gasto_mes(user_id, mes=mes, conta_id=conta_id)
+
+
+def resolver_conta(user_id, conta_nome):
+    """Resolve um nome de conta vindo do usuário/IA pra um conta_id.
+
+    Retorna (status, conta_id, conta_obj) onde status é:
+      - 'ok'         : achou a conta certinha (use conta_id)
+      - 'nenhuma'    : usuário não tem nenhuma conta cadastrada (use NULL = Geral)
+      - 'sem_filtro' : usuário não especificou conta E tem múltiplas (use NULL)
+      - 'unica'      : usuário não especificou mas tem só 1 conta — use ela
+      - 'nao_encontrada' : nome dado mas não bate com nenhuma conta
+      - 'ambigua'    : nome dado bate em várias contas
+    """
+    contas = listar_contas(user_id)
+    nome = _s(conta_nome).strip()
+    if not nome:
+        if not contas:
+            return ("nenhuma", None, None)
+        if len(contas) == 1:
+            c = contas[0]
+            return ("unica", c[0], c)
+        return ("sem_filtro", None, None)
+    if not contas:
+        return ("nenhuma", None, None)
+    achou = buscar_conta(user_id, nome=nome)
+    if achou:
+        return ("ok", achou[0], achou)
+    # Verifica se foi ambíguo (sub-string com múltiplos matches)
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, nome FROM contas "
+        "WHERE user_id = ? AND (LOWER(nome) LIKE LOWER(?) OR LOWER(COALESCE(banco,'')) LIKE LOWER(?))",
+        (user_id, f"%{nome}%", f"%{nome}%"),
+    ).fetchall()
+    conn.close()
+    if len(rows) > 1:
+        return ("ambigua", None, rows)
+    return ("nao_encontrada", None, None)
+
+
+def transferir_entre_contas(user_id, conta_origem_id, conta_destino_id, valor):
+    """Cria 1 gasto na conta origem ('Transferência saída') e 1 receita na destino
+    ('Transferência entrada'). Retorna (gasto_id, receita_id)."""
+    conta_origem = buscar_conta(user_id, conta_id=conta_origem_id)
+    conta_destino = buscar_conta(user_id, conta_id=conta_destino_id)
+    nome_origem = conta_origem[1] if conta_origem else "?"
+    nome_destino = conta_destino[1] if conta_destino else "?"
+    salvar_gasto(
+        user_id, valor, "Transferência",
+        f"Transferência para {nome_destino}",
+        metodo_pagamento="Transferência",
+        conta_id=conta_origem_id,
+    )
+    salvar_receita(
+        user_id, valor, "Transferência",
+        f"Transferência de {nome_origem}",
+        conta_id=conta_destino_id,
+    )
+
+
 # ================= INVESTIMENTOS =================
 
 TIPOS_INVESTIMENTO = ["Reserva", "Renda Fixa", "Ações", "FIIs", "Cripto", "Outros"]
@@ -610,11 +904,12 @@ def normalizar_tipo_investimento(t):
     return mapa.get(t, "Outros")
 
 
-def registrar_investimento(user_id, tipo, nome, valor):
+def registrar_investimento(user_id, tipo, nome, valor, conta_id=None):
     conn = db()
     cur = conn.execute(
-        "INSERT INTO investimentos (user_id, tipo, nome, valor, data) VALUES (?, ?, ?, ?, ?)",
-        (user_id, normalizar_tipo_investimento(tipo), nome, valor, datetime.now().isoformat()),
+        "INSERT INTO investimentos (user_id, tipo, nome, valor, data, conta_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, normalizar_tipo_investimento(tipo), nome, valor, datetime.now().isoformat(), conta_id),
     )
     iid = cur.lastrowid
     conn.commit()
@@ -1204,24 +1499,32 @@ def normalizar_metodo(m):
     return mapa.get(m)
 
 
-def salvar_gasto(user_id, valor, categoria, descricao, data=None, metodo_pagamento=None):
+def salvar_gasto(user_id, valor, categoria, descricao, data=None, metodo_pagamento=None, conta_id=None):
     conn = db()
     data = data or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn.execute(
-        "INSERT INTO gastos (user_id, data, valor, categoria, descricao, metodo_pagamento) VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, data, valor, categoria, descricao, metodo_pagamento),
+        "INSERT INTO gastos (user_id, data, valor, categoria, descricao, metodo_pagamento, conta_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, data, valor, categoria, descricao, metodo_pagamento, conta_id),
     )
     conn.commit()
     conn.close()
 
 
-def total_gasto_mes(user_id, mes=None):
+def total_gasto_mes(user_id, mes=None, conta_id=None):
+    """Total de gastos do mês. conta_id=None → todas as contas (incluindo NULL/Geral)."""
     mes = mes or mes_atual()
     conn = db()
-    total = conn.execute(
-        "SELECT SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ?",
-        (user_id, mes),
-    ).fetchone()[0]
+    if conta_id is None:
+        total = conn.execute(
+            "SELECT SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ?",
+            (user_id, mes),
+        ).fetchone()[0]
+    else:
+        total = conn.execute(
+            "SELECT SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND conta_id = ?",
+            (user_id, mes, conta_id),
+        ).fetchone()[0]
     conn.close()
     return total or 0.0
 
@@ -1440,20 +1743,22 @@ def editar_cartao(user_id, cartao_id, novo_nome=None, novo_limite=None,
 
 # ================= RECEITAS =================
 
-def adicionar_receita_fixa(user_id, descricao, valor, fonte, dia_mes):
+def adicionar_receita_fixa(user_id, descricao, valor, fonte, dia_mes, conta_id=None):
     conn = db()
     conn.execute(
-        """INSERT INTO receitas_fixas (user_id, descricao, valor, fonte, dia_mes, ultimo_mes_aplicado)
-           VALUES (?, ?, ?, ?, ?, NULL)""",
-        (user_id, descricao, valor, fonte, dia_mes),
+        """INSERT INTO receitas_fixas (user_id, descricao, valor, fonte, dia_mes, ultimo_mes_aplicado, conta_id)
+           VALUES (?, ?, ?, ?, ?, NULL, ?)""",
+        (user_id, descricao, valor, fonte, dia_mes, conta_id),
     )
     conn.commit()
     conn.close()
 
 def listar_receitas_fixas(user_id):
+    """Retorna (id, descricao, valor, fonte, dia_mes, conta_id)."""
     conn = db()
     rows = conn.execute(
-        "SELECT id, descricao, valor, fonte, dia_mes FROM receitas_fixas WHERE user_id = ? ORDER BY dia_mes",
+        "SELECT id, descricao, valor, fonte, dia_mes, conta_id FROM receitas_fixas "
+        "WHERE user_id = ? ORDER BY dia_mes",
         (user_id,),
     ).fetchall()
     conn.close()
@@ -1478,21 +1783,21 @@ def aplicar_receitas_fixas_do_dia():
     # pega as com dia_mes > último (ex: dia 31 em fev) — pra não pular o mês.
     if dia == ultimo:
         rows = conn.execute(
-            """SELECT id, user_id, descricao, valor, fonte FROM receitas_fixas
+            """SELECT id, user_id, descricao, valor, fonte, conta_id FROM receitas_fixas
                WHERE dia_mes >= ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
             (dia, mes),
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT id, user_id, descricao, valor, fonte FROM receitas_fixas
+            """SELECT id, user_id, descricao, valor, fonte, conta_id FROM receitas_fixas
                WHERE dia_mes = ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
             (dia, mes),
         ).fetchall()
     aplicados = 0
-    for fid, user_id, desc, valor, fonte in rows:
+    for fid, user_id, desc, valor, fonte, conta_id in rows:
         conn.execute(
-            "INSERT INTO receitas (user_id, data, valor, fonte, descricao) VALUES (?, ?, ?, ?, ?)",
-            (user_id, hoje.strftime("%Y-%m-%d %H:%M:%S"), valor, fonte, desc),
+            "INSERT INTO receitas (user_id, data, valor, fonte, descricao, conta_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, hoje.strftime("%Y-%m-%d %H:%M:%S"), valor, fonte, desc, conta_id),
         )
         conn.execute(
             "UPDATE receitas_fixas SET ultimo_mes_aplicado = ? WHERE id = ?", (mes, fid)
@@ -1502,23 +1807,30 @@ def aplicar_receitas_fixas_do_dia():
     conn.close()
     if aplicados:
         print(f"Aplicadas {aplicados} receitas fixas hoje ({hoje.date()})")
-def salvar_receita(user_id, valor, fonte, descricao):
+def salvar_receita(user_id, valor, fonte, descricao, conta_id=None):
     conn = db()
     conn.execute(
-        "INSERT INTO receitas (user_id, data, valor, fonte, descricao) VALUES (?, ?, ?, ?, ?)",
-        (user_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), valor, fonte, descricao),
+        "INSERT INTO receitas (user_id, data, valor, fonte, descricao, conta_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), valor, fonte, descricao, conta_id),
     )
     conn.commit()
     conn.close()
 
 
-def total_receita_mes(user_id, mes=None):
+def total_receita_mes(user_id, mes=None, conta_id=None):
     mes = mes or mes_atual()
     conn = db()
-    total = conn.execute(
-        "SELECT SUM(valor) FROM receitas WHERE user_id = ? AND strftime('%Y-%m', data) = ?",
-        (user_id, mes),
-    ).fetchone()[0]
+    if conta_id is None:
+        total = conn.execute(
+            "SELECT SUM(valor) FROM receitas WHERE user_id = ? AND strftime('%Y-%m', data) = ?",
+            (user_id, mes),
+        ).fetchone()[0]
+    else:
+        total = conn.execute(
+            "SELECT SUM(valor) FROM receitas WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND conta_id = ?",
+            (user_id, mes, conta_id),
+        ).fetchone()[0]
     conn.close()
     return total or 0.0
 
@@ -1624,21 +1936,23 @@ def status_meta_texto(user_id):
 
 # ================= GASTOS FIXOS =================
 
-def adicionar_gasto_fixo(user_id, descricao, valor, categoria, dia_mes):
+def adicionar_gasto_fixo(user_id, descricao, valor, categoria, dia_mes, conta_id=None):
     conn = db()
     conn.execute(
-        """INSERT INTO gastos_fixos (user_id, descricao, valor, categoria, dia_mes, ultimo_mes_aplicado)
-           VALUES (?, ?, ?, ?, ?, NULL)""",
-        (user_id, descricao, valor, categoria, dia_mes),
+        """INSERT INTO gastos_fixos (user_id, descricao, valor, categoria, dia_mes, ultimo_mes_aplicado, conta_id)
+           VALUES (?, ?, ?, ?, ?, NULL, ?)""",
+        (user_id, descricao, valor, categoria, dia_mes, conta_id),
     )
     conn.commit()
     conn.close()
 
 
 def listar_gastos_fixos(user_id):
+    """Retorna (id, descricao, valor, categoria, dia_mes, conta_id)."""
     conn = db()
     rows = conn.execute(
-        "SELECT id, descricao, valor, categoria, dia_mes FROM gastos_fixos WHERE user_id = ? ORDER BY dia_mes",
+        "SELECT id, descricao, valor, categoria, dia_mes, conta_id FROM gastos_fixos "
+        "WHERE user_id = ? ORDER BY dia_mes",
         (user_id,),
     ).fetchall()
     conn.close()
@@ -1667,21 +1981,22 @@ def aplicar_gastos_fixos_do_dia():
     conn = db()
     if dia == ultimo:
         rows = conn.execute(
-            """SELECT id, user_id, descricao, valor, categoria FROM gastos_fixos
+            """SELECT id, user_id, descricao, valor, categoria, conta_id FROM gastos_fixos
                WHERE dia_mes >= ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
             (dia, mes),
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT id, user_id, descricao, valor, categoria FROM gastos_fixos
+            """SELECT id, user_id, descricao, valor, categoria, conta_id FROM gastos_fixos
                WHERE dia_mes = ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
             (dia, mes),
         ).fetchall()
     aplicados = 0
-    for fid, user_id, desc, valor, categoria in rows:
+    for fid, user_id, desc, valor, categoria, conta_id in rows:
         conn.execute(
-            "INSERT INTO gastos (user_id, data, valor, categoria, descricao, metodo_pagamento) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, hoje.strftime("%Y-%m-%d %H:%M:%S"), valor, categoria, desc, None),
+            "INSERT INTO gastos (user_id, data, valor, categoria, descricao, metodo_pagamento, conta_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, hoje.strftime("%Y-%m-%d %H:%M:%S"), valor, categoria, desc, None, conta_id),
         )
         conn.execute(
             "UPDATE gastos_fixos SET ultimo_mes_aplicado = ? WHERE id = ?", (mes, fid)
@@ -1696,19 +2011,21 @@ def aplicar_gastos_fixos_do_dia():
 # ================= PARCELAMENTOS =================
 
 def adicionar_parcelamento(user_id, descricao, valor_total, total_parcelas,
-                           dia_cobranca, categoria, metodo_pagamento, cartao_id=None):
+                           dia_cobranca, categoria, metodo_pagamento, cartao_id=None,
+                           conta_id=None):
     """Cria parcelamento. Se cartao_id for informado, as parcelas são lançadas
     como compras no cartão (gastos_cartao) e batem na fatura/limite. Se não,
-    são lançadas como gasto comum (gastos)."""
+    são lançadas como gasto comum (gastos). Se cartao_id estiver presente, a
+    conta_id do parcelamento é ignorada — usa a conta_id_pagamento do cartão."""
     valor_parcela = round(valor_total / total_parcelas, 2)
     conn = db()
     cur = conn.execute(
         """INSERT INTO parcelamentos
            (user_id, descricao, valor_parcela, total_parcelas, parcelas_pagas,
-            dia_cobranca, categoria, metodo_pagamento, criado_em, cartao_id)
-           VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
+            dia_cobranca, categoria, metodo_pagamento, criado_em, cartao_id, conta_id)
+           VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
         (user_id, descricao, valor_parcela, total_parcelas, dia_cobranca,
-         categoria, metodo_pagamento, datetime.now().isoformat(), cartao_id),
+         categoria, metodo_pagamento, datetime.now().isoformat(), cartao_id, conta_id),
     )
     pid = cur.lastrowid
     conn.commit()
@@ -1751,7 +2068,7 @@ def aplicar_parcelamentos_do_dia(forcar_id=None):
     if forcar_id:
         rows = conn.execute(
             """SELECT id, user_id, descricao, valor_parcela, total_parcelas,
-                      parcelas_pagas, categoria, metodo_pagamento, cartao_id
+                      parcelas_pagas, categoria, metodo_pagamento, cartao_id, conta_id
                FROM parcelamentos WHERE id = ?
                  AND parcelas_pagas < total_parcelas
                  AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
@@ -1764,7 +2081,7 @@ def aplicar_parcelamentos_do_dia(forcar_id=None):
         if dia == ultimo:
             rows = conn.execute(
                 """SELECT id, user_id, descricao, valor_parcela, total_parcelas,
-                          parcelas_pagas, categoria, metodo_pagamento, cartao_id
+                          parcelas_pagas, categoria, metodo_pagamento, cartao_id, conta_id
                    FROM parcelamentos
                    WHERE dia_cobranca >= ? AND parcelas_pagas < total_parcelas
                      AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
@@ -1773,40 +2090,44 @@ def aplicar_parcelamentos_do_dia(forcar_id=None):
         else:
             rows = conn.execute(
                 """SELECT id, user_id, descricao, valor_parcela, total_parcelas,
-                          parcelas_pagas, categoria, metodo_pagamento, cartao_id
+                          parcelas_pagas, categoria, metodo_pagamento, cartao_id, conta_id
                    FROM parcelamentos
                    WHERE dia_cobranca = ? AND parcelas_pagas < total_parcelas
                      AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
                 (dia, mes),
             ).fetchall()
     aplicados = 0
-    for pid, user_id, desc, vp, total, pagas, cat, metodo, cartao_id in rows:
+    for pid, user_id, desc, vp, total, pagas, cat, metodo, cartao_id, conta_id in rows:
         nova = pagas + 1
         descricao_completa = f"{desc} ({nova}/{total})"
         if cartao_id:
-            # Lança no cartão (afeta fatura e limite)
+            # Lança no cartão (afeta fatura e limite). conta_id da parcela é
+            # ignorada — herda da conta_id_pagamento do cartão.
             cartao_row = conn.execute(
-                "SELECT dia_fechamento FROM cartoes_credito WHERE id = ? AND user_id = ?",
+                "SELECT dia_fechamento, conta_id_pagamento FROM cartoes_credito WHERE id = ? AND user_id = ?",
                 (cartao_id, user_id),
             ).fetchone()
             if cartao_row:
                 data_lanc = hoje.strftime("%Y-%m-%d %H:%M:%S")
                 fatura_mes = calcular_fatura_mes(data_lanc[:10], cartao_row[0])
+                cartao_conta_id = cartao_row[1]
                 conn.execute(
-                    "INSERT INTO gastos_cartao (user_id, cartao_id, valor, categoria, descricao, data, fatura_mes) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (user_id, cartao_id, vp, cat, descricao_completa, data_lanc, fatura_mes),
+                    "INSERT INTO gastos_cartao (user_id, cartao_id, valor, categoria, descricao, data, fatura_mes, conta_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, cartao_id, vp, cat, descricao_completa, data_lanc, fatura_mes, cartao_conta_id),
                 )
             else:
                 # Cartão sumiu — fallback pra gasto comum
                 conn.execute(
-                    "INSERT INTO gastos (user_id, data, valor, categoria, descricao, metodo_pagamento) VALUES (?, ?, ?, ?, ?, ?)",
-                    (user_id, hoje.strftime("%Y-%m-%d %H:%M:%S"), vp, cat, descricao_completa, metodo),
+                    "INSERT INTO gastos (user_id, data, valor, categoria, descricao, metodo_pagamento, conta_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, hoje.strftime("%Y-%m-%d %H:%M:%S"), vp, cat, descricao_completa, metodo, conta_id),
                 )
         else:
             conn.execute(
-                "INSERT INTO gastos (user_id, data, valor, categoria, descricao, metodo_pagamento) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, hoje.strftime("%Y-%m-%d %H:%M:%S"), vp, cat, descricao_completa, metodo),
+                "INSERT INTO gastos (user_id, data, valor, categoria, descricao, metodo_pagamento, conta_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, hoje.strftime("%Y-%m-%d %H:%M:%S"), vp, cat, descricao_completa, metodo, conta_id),
             )
         conn.execute(
             "UPDATE parcelamentos SET parcelas_pagas = ?, ultimo_mes_aplicado = ? WHERE id = ?",
@@ -2643,6 +2964,136 @@ def cmd_cartao_remover(message):
     )
 
 
+# ================= CONTAS BANCÁRIAS (slash commands) =================
+
+@bot.message_handler(commands=["contas"])
+def cmd_contas(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    contas = listar_contas(user_id)
+    if not contas:
+        bot.reply_to(
+            message,
+            "Você ainda não cadastrou nenhuma conta. Use `/conta_nova <nome> [tipo] [banco]` "
+            "ou diga 'cria uma conta Nubank'.\n\n"
+            "Lançamentos sem conta vão pra pilha *Geral*.",
+            parse_mode="Markdown",
+        )
+        return
+    texto = "🏦 *Suas contas:*\n"
+    for cid, nome, banco, tipo, _criado in contas:
+        saldo = saldo_conta(user_id, cid)
+        detalhes = tipo or "Conta"
+        if banco and banco.lower() != nome.lower():
+            detalhes += f" · {banco}"
+        texto += f"\n• #{cid} *{escape_md(nome)}* ({detalhes})\n  Saldo do mês: R$ {saldo:.2f}"
+    bot.reply_to(message, texto, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["conta_nova"])
+def cmd_conta_nova(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=3)
+    if len(partes) < 2:
+        bot.reply_to(
+            message,
+            "Uso: `/conta_nova <nome> [tipo] [banco]`\n"
+            "Ex: `/conta_nova Nubank corrente Nubank`\n"
+            "Tipos válidos: corrente, poupança, digital, conjunta, salário",
+            parse_mode="Markdown",
+        )
+        return
+    nome = partes[1].strip()
+    tipo = partes[2].strip() if len(partes) >= 3 else ""
+    banco = partes[3].strip() if len(partes) >= 4 else nome
+    if buscar_conta(user_id, nome=nome):
+        bot.reply_to(message, f"Você já tem uma conta chamada *{escape_md(nome)}*.", parse_mode="Markdown")
+        return
+    cid = criar_conta(user_id, nome, banco=banco, tipo=tipo)
+    bot.reply_to(
+        message,
+        f"🏦 Conta *{escape_md(nome)}* cadastrada (#{cid}, {normalizar_tipo_conta(tipo)})!",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["conta_remover"])
+def cmd_conta_remover(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=1)
+    if len(partes) < 2:
+        bot.reply_to(message, "Uso: `/conta_remover <nome>`", parse_mode="Markdown")
+        return
+    nome = partes[1].strip()
+    status, cid, obj = resolver_conta(user_id, nome)
+    if status == "ambigua":
+        nomes = ", ".join(c[1] for c in obj)
+        bot.reply_to(message, f"Ambíguo. Tem mais de uma conta com esse nome ({nomes}).")
+        return
+    if status != "ok":
+        bot.reply_to(message, f"Conta *{escape_md(nome)}* não encontrada.", parse_mode="Markdown")
+        return
+    n_lanc = contar_lancamentos_conta(user_id, cid)
+    set_pendente(user_id, "remover_conta", {"conta_id": cid, "nome": obj[1]})
+    aviso = f"\nEla tem *{n_lanc}* lançamento(s) — eles viram 'Geral' (não são apagados)." if n_lanc else ""
+    bot.reply_to(
+        message,
+        f"⚠️ Confirmar remoção da conta *{escape_md(obj[1])}*?{aviso}\n\n"
+        f"Responde *sim* pra confirmar ou *não* pra cancelar.",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["saldo"])
+def cmd_saldo(message):
+    user_id = message.chat.id
+    if not usuario_autorizado(user_id):
+        return
+    partes = message.text.split(maxsplit=1)
+    nome_filtro = partes[1].strip() if len(partes) >= 2 else ""
+    if nome_filtro:
+        status, cid, obj = resolver_conta(user_id, nome_filtro)
+        if status == "ambigua":
+            nomes = ", ".join(c[1] for c in obj)
+            bot.reply_to(message, f"Ambíguo: {nomes}.")
+            return
+        if status != "ok":
+            bot.reply_to(message, f"Conta *{escape_md(nome_filtro)}* não encontrada.", parse_mode="Markdown")
+            return
+        rec = total_receita_mes(user_id, conta_id=cid)
+        gas = total_gasto_mes(user_id, conta_id=cid)
+        bot.reply_to(
+            message,
+            f"🏦 *{escape_md(obj[1])}* — saldo do mês\n"
+            f"➕ Entradas: R$ {rec:.2f}\n➖ Saídas: R$ {gas:.2f}\n💰 Saldo: R$ {rec-gas:.2f}",
+            parse_mode="Markdown",
+        )
+        return
+    contas = listar_contas(user_id)
+    rec_geral = total_receita_mes(user_id)
+    gas_geral = total_gasto_mes(user_id)
+    texto = (
+        f"💰 *Saldo do mês ({fmt_mes(mes_atual())})*\n"
+        f"➕ Entradas: R$ {rec_geral:.2f}\n➖ Saídas: R$ {gas_geral:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━\n💵 Saldo total: R$ {rec_geral - gas_geral:.2f}"
+    )
+    if contas:
+        texto += "\n\n*Por conta:*"
+        soma_contas = 0.0
+        for cid, nome_c, _b, _t, _c in contas:
+            s = saldo_conta(user_id, cid)
+            soma_contas += s
+            texto += f"\n• {escape_md(nome_c)}: R$ {s:.2f}"
+        geral = (rec_geral - gas_geral) - soma_contas
+        texto += f"\n• _Geral (sem conta): R$ {geral:.2f}_"
+    bot.reply_to(message, texto, parse_mode="Markdown")
+
+
 @bot.message_handler(commands=["investir"])
 def cmd_investir(message):
     user_id = message.chat.id
@@ -2962,6 +3413,10 @@ def send_welcome(message):
         "💬 *Você pode falar comigo naturalmente:*\n"
         "• 'gastei 50 no mercado no débito'\n"
         "• 'gastei 80 no ifood no crédito Nubank' (vai pra fatura!)\n"
+        "• 'gastei 30 no mercado pelo Itaú' (debita de uma conta específica)\n"
+        "• 'recebi 3000 de salário no Nubank'\n"
+        "• 'transferi 500 do Nubank pro Itaú'\n"
+        "• 'qual o saldo do Itaú?'\n"
         "• 'gasto de 200 vence dia 15/05/2026' (agendado)\n"
         "• 'comprei celular 1200 em 12x' (parcelamento)\n"
         "• 'recebi 3000 de salário'\n"
@@ -2984,6 +3439,11 @@ def send_welcome(message):
         "• 'meus gastos de hoje' / 'extrato de ontem' / 'gastos do dia 15'\n"
         "• 'contas a pagar' (gastos futuros do mês)\n"
         "• 'apaga o último'\n\n"
+        "🏦 *Contas bancárias (comandos):*\n"
+        "• /contas — lista suas contas e saldos\n"
+        "• /conta\\_nova `<nome> [tipo] [banco]` — cadastra conta\n"
+        "• /conta\\_remover `<nome>` — remove conta (lançamentos viram 'Geral')\n"
+        "• /saldo `[nome]` — saldo geral ou de uma conta específica\n\n"
         "💳 *Cartão de crédito (comandos):*\n"
         "• /cartao\\_novo `<nome> <limite> <fec> <venc>` — cadastra cartão\n"
         "• /cartoes — lista cartões e limites\n"
@@ -3292,7 +3752,13 @@ Classifique a mensagem em UMA das intenções:
 - "listar_receitas_fixas": ver receitas fixas cadastradas.
 - "remover_receita_fixa": remover uma receita fixa (extraia o ID em "fixo_id" se mencionado).
 - "apagar_receita": remover TODAS as receitas do mês atual (ex: "zere minhas receitas", "apague as receitas de abril"). Ação destrutiva — o sistema vai pedir confirmação.
-- "ajustar_saldo": forçar o saldo a bater com um valor exato (ex: "ajuste meu saldo para 100", "meu saldo é 50").
+- "ajustar_saldo": ajustar o saldo do mês (não confundir com gasto/receita normal). Tem 3 MODOS — você DEVE escolher o certo no campo "modo_ajuste":
+    * "definir": forçar o saldo a bater EXATAMENTE com um valor (ex: "ajuste meu saldo para 100", "meu saldo é 50", "saldo deveria ser 200", "corrige o saldo pra 1000"). Em "valor" o saldo desejado.
+    * "subtrair": tirar/remover/abater um valor do saldo atual SEM ser um gasto categorizado (ex: "tira 0,23 do saldo", "abate 5 do meu saldo", "diminui 10 do saldo", "remove 2 reais do saldo atual"). Em "valor" o quanto SAIR.
+    * "somar": somar/adicionar/colocar um valor extra no saldo SEM ser uma receita categorizada (ex: "soma 5 no saldo", "adiciona 10 ao saldo", "joga 20 no saldo"). Em "valor" o quanto ENTRAR.
+  REGRA CRÍTICA: se o usuário disser "tire X do saldo", "abate X", "diminui X do saldo" — modo SEMPRE "subtrair", NUNCA "definir". O valor é o quanto sai, NÃO o saldo desejado.
+  Default = "definir" só se o usuário não usou verbo de movimento (tirar/somar/abater).
+  Se o usuário disser uma conta específica ("ajusta o saldo do nubank pra 50"), preencha "conta" com o nome.
 - "listar_gastos_futuros": listar ou mostrar contas a pagar, gastos futuros, agendados, ou o que falta pagar neste mês.
 - "resumo_diario": usuário pede para ver entradas, saídas, gastos ou receitas de um dia específico
   (ex: "meus gastos de hoje", "o que entrou hoje", "extrato de ontem", "gastos do dia 15", "movimentações de hoje", "quanto gastei hoje?", "meu relatório de hoje").
@@ -3314,6 +3780,34 @@ Classifique a mensagem em UMA das intenções:
 - "editar_cartao": editar dados de um cartão de crédito (ex: "muda o limite do Nubank pra 8000", "renomeia Inter pra Inter Black", "muda dia de fechamento do Nubank pra 25"). Em "cartao_nome" o nome atual. Em "novo_cartao_nome" o novo nome (se renomear). Em "valor" o novo limite (se mudar limite). Em "dia_mes" o novo dia de fechamento. Em "dia_venc" o novo dia de vencimento.
 - "confirmar": usuário responde afirmativamente a uma pergunta de confirmação anterior do bot ("sim", "confirma", "pode apagar", "isso aí", "manda ver", "tá certo", "ok"). Use SOMENTE quando a mensagem é APENAS uma confirmação curta e o usuário acabou de receber uma pergunta de confirmação (apagar, criar, escolher). NÃO use "confirmar" como intenção pra outras confirmações.
 - "cancelar": usuário cancela a ação pendente ("não", "cancela", "deixa quieto", "esquece").
+
+# CONTAS BANCÁRIAS (multi-conta) =========================================
+# O usuário pode ter VÁRIAS contas (Nubank, Itaú, Caixa, etc.) e querer separar
+# o dinheiro por conta. Em QUALQUER intenção de movimentação (registrar_gasto,
+# registrar_receita, registrar_gasto_credito, registrar_investimento,
+# adicionar_gasto_fixo, adicionar_receita_fixa, adicionar_parcelamento, ajustar_saldo)
+# se o usuário disser de qual conta saiu/entrou ("paguei 50 no mercado pelo nubank",
+# "salário 3000 caiu na conta itau", "tirei 100 do santander"), preencha "conta"
+# com o nome do banco/conta. Se ele NÃO disser, deixe "conta" vazio.
+
+- "criar_conta": usuário quer cadastrar uma nova conta bancária
+  (ex: "cria uma conta nubank", "adiciona o banco itau", "nova conta santander corrente",
+  "registra minha conta caixa poupança", "cadastra a conta inter").
+  Em "conta" coloque o nome da conta (geralmente o banco — ex: "Nubank", "Itau", "Inter").
+  Em "tipo_conta" coloque um de: Corrente, Poupança, Digital, Salário, Dinheiro, Outro
+  (default Corrente se não mencionado).
+- "listar_contas": ver todas as contas cadastradas (ex: "minhas contas", "lista as contas", "quais bancos eu uso", "mostra meus bancos").
+- "remover_conta": apagar uma conta (ex: "remove a conta nubank", "apaga o banco itau", "exclui minha conta caixa", "deleta o santander").
+  Em "conta" o nome da conta a remover. Ação destrutiva — o sistema vai pedir confirmação.
+- "renomear_conta": renomear ou alterar dados de uma conta (ex: "renomeia o nubank pra Nu Pessoa Física", "muda o tipo da caixa pra poupança", "altera o banco do itau pra Itaú Personnalité").
+  Em "conta" o nome ATUAL. Em "novo_conta_nome" o novo nome (se renomear).
+  Em "tipo_conta" o novo tipo (se mudar tipo). Em "banco_nome" o novo banco (se mudar banco).
+- "transferir_conta": transferir dinheiro entre 2 contas (ex: "transferi 500 do nubank pro itau", "passa 100 da caixa pro inter", "move 1000 do santander pra reserva").
+  Em "valor" o valor. Em "conta" a conta de ORIGEM. Em "conta_destino" a conta de DESTINO.
+  Não confundir com "transferir_investimento" (que move entre investimentos).
+- "consultar_saldo": usuário quer ver o saldo de uma conta específica OU de todas
+  (ex: "saldo do nubank", "quanto tem no itau", "qual meu saldo", "saldo das contas", "saldo geral").
+  Em "conta" coloque o nome da conta se mencionada. Vazio = saldo de todas.
 
 Retorne SEMPRE este JSON:
 {
@@ -3339,6 +3833,12 @@ Retorne SEMPRE este JSON:
   "tipo_dia": "<gastos|receitas|ambos ou vazio — pra resumo_diario>",
   "dia_relativo": "<hoje|ontem|outro ou vazio — pra resumo_diario>",
   "data_futura": "<YYYY-MM-DD ou null>",
+  "modo_ajuste": "<definir|somar|subtrair ou vazio — só pra ajustar_saldo>",
+  "conta": "<nome da conta bancária se mencionada (origem em transferir_conta), ou vazio>",
+  "conta_destino": "<conta de destino, só pra transferir_conta, ou vazio>",
+  "novo_conta_nome": "<novo nome da conta, só pra renomear_conta, ou vazio>",
+  "tipo_conta": "<Corrente|Poupança|Digital|Salário|Dinheiro|Outro ou vazio>",
+  "banco_nome": "<nome do banco da conta (pra criar_conta/renomear_conta), ou vazio>",
   "resposta": "<texto curto e amigável em PT-BR — preencha em 'conversa' ou pra pedir esclarecimento>"
 }
 
@@ -3374,6 +3874,19 @@ def executar_pendente(user_id, message):
                 f"🗑️ Cartão *{escape_md(nome)}* removido (junto com os lançamentos dele).",
                 parse_mode="Markdown",
             )
+
+        elif acao == "remover_conta":
+            conta_id = dados.get("conta_id")
+            nome = dados.get("nome", "?")
+            n = remover_conta(user_id, conta_id)
+            if n:
+                bot.reply_to(
+                    message,
+                    f"🗑️ Conta *{escape_md(nome)}* removida. Lançamentos antigos viraram 'Geral'.",
+                    parse_mode="Markdown",
+                )
+            else:
+                bot.reply_to(message, "Conta não encontrada (talvez já tenha sido removida).")
 
         elif acao == "apagar_receitas_mes":
             mes = dados.get("mes") or mes_atual()
@@ -3552,6 +4065,34 @@ def processar_foto(message):
         bot.reply_to(message, "Tive um problema pra ler a foto. Pode tentar de novo?")
 
 
+def _resolver_conta_intent(user_id, conta_nome, message):
+    """Helper de dispatcher: resolve nome de conta vindo da IA pra conta_id (int) ou
+    None (sem filtro / Geral). Se a conta não bater, JÁ RESPONDE no chat e retorna False
+    pra o handler interromper. Retornos:
+        int   → use esse conta_id no insert
+        None  → sem conta específica (Geral)
+        False → erro já reportado, dê 'return' no handler
+    """
+    nome = _s(conta_nome).strip() if conta_nome else ""
+    if not nome:
+        return None
+    status, cid, obj = resolver_conta(user_id, nome)
+    if status == "ok":
+        return cid
+    if status == "ambigua":
+        nomes = ", ".join(c[1] for c in obj)
+        bot.reply_to(message, f"Tem mais de uma conta com esse nome ({nomes}). Seja mais específico.")
+        return False
+    if status == "nao_encontrada":
+        bot.reply_to(message, f"Não achei conta chamada *{escape_md(nome)}*. Use /contas pra listar.", parse_mode="Markdown")
+        return False
+    if status == "nenhuma":
+        # usuário citou conta mas não tem nenhuma cadastrada — só ignora o filtro
+        bot.reply_to(message, "Você ainda não cadastrou nenhuma conta. Use /conta_nova ou diga 'cria uma conta nubank'.")
+        return False
+    return None
+
+
 @bot.message_handler(func=lambda message: True)
 def processar_mensagem(message):
     user_id = message.chat.id
@@ -3641,7 +4182,12 @@ def processar_mensagem(message):
                 except ValueError:
                     data_lancamento = None  # IA inventou data inválida — ignora
 
-            salvar_gasto(user_id, valor, categoria, descricao, data=data_lancamento, metodo_pagamento=metodo)
+            conta_id_g = _resolver_conta_intent(user_id, dados.get("conta"), message)
+            if conta_id_g is False:
+                return
+
+            salvar_gasto(user_id, valor, categoria, descricao, data=data_lancamento,
+                         metodo_pagamento=metodo, conta_id=conta_id_g)
 
             # Mensagem de confirmação inteligente
             prefixo = "⏳ Agendado!" if data_lancamento else "✅ Anotado!"
@@ -3650,6 +4196,10 @@ def processar_mensagem(message):
                 resp += f"\n📝 {escape_md(descricao)}"
             if metodo:
                 resp += f"\n💳 {metodo}"
+            if conta_id_g:
+                conta_obj_g = buscar_conta(user_id, conta_id=conta_id_g)
+                if conta_obj_g:
+                    resp += f"\n🏦 {escape_md(conta_obj_g[1])}"
             if data_lancamento:
                 data_pt = datetime.strptime(data_lancamento, "%Y-%m-%d %H:%M:%S").strftime("%d/%m/%Y")
                 resp += f"\n📅 Vencimento: {data_pt}"
@@ -3805,13 +4355,19 @@ def processar_mensagem(message):
                 return
             tipo = (dados.get("tipo_inv") or "Outros").strip()
             nome = (dados.get("nome_inv") or dados.get("descricao") or "Investimento").strip()
-            iid = registrar_investimento(user_id, tipo, nome, valor)
-            bot.reply_to(
-                message,
+            conta_id_inv = _resolver_conta_intent(user_id, dados.get("conta"), message)
+            if conta_id_inv is False:
+                return
+            iid = registrar_investimento(user_id, tipo, nome, valor, conta_id=conta_id_inv)
+            resp_inv = (
                 f"📈 Investimento registrado (#{iid})\n"
-                f"💰 R$ {valor:.2f} em *{nome}* ({normalizar_tipo_investimento(tipo)})",
-                parse_mode="Markdown",
+                f"💰 R$ {valor:.2f} em *{nome}* ({normalizar_tipo_investimento(tipo)})"
             )
+            if conta_id_inv:
+                conta_obj_inv = buscar_conta(user_id, conta_id=conta_id_inv)
+                if conta_obj_inv:
+                    resp_inv += f"\n🏦 Saiu de: {escape_md(conta_obj_inv[1])}"
+            bot.reply_to(message, resp_inv, parse_mode="Markdown")
 
         elif intencao == "listar_investimentos":
             cmd_investimentos(message)
@@ -3976,10 +4532,20 @@ def processar_mensagem(message):
             if dia is None:
                 bot.reply_to(message, "Em qual dia do mês você recebe? (1-31). Ex: 'recebo 828 todo dia 15'.")
                 return
-            adicionar_receita_fixa(user_id, descricao, valor, fonte, dia)
+            conta_id_rf = _resolver_conta_intent(user_id, dados.get("conta"), message)
+            if conta_id_rf is False:
+                return
+            adicionar_receita_fixa(user_id, descricao, valor, fonte, dia, conta_id=conta_id_rf)
+            extra_rf = ""
+            if conta_id_rf:
+                conta_obj_rf = buscar_conta(user_id, conta_id=conta_id_rf)
+                if conta_obj_rf:
+                    extra_rf = f"\n• Cai na conta *{escape_md(conta_obj_rf[1])}*."
             bot.reply_to(
                 message,
-                f"💸 Receita automática programada!\n• {descricao} — R$ {valor:.2f} ({fonte})\n• Vai cair na conta todo dia {dia:02d}.",
+                f"💸 Receita automática programada!\n• {descricao} — R$ {valor:.2f} ({fonte})\n"
+                f"• Vai cair na conta todo dia {dia:02d}.{extra_rf}",
+                parse_mode="Markdown",
             )
 
         elif intencao == "listar_receitas_fixas":
@@ -4007,10 +4573,17 @@ def processar_mensagem(message):
                 return
             fonte = (dados.get("fonte") or dados.get("categoria") or "Outros").strip() or "Outros"
             descricao = (dados.get("descricao") or "").strip()
-            salvar_receita(user_id, valor, fonte, descricao)
+            conta_id_r = _resolver_conta_intent(user_id, dados.get("conta"), message)
+            if conta_id_r is False:
+                return
+            salvar_receita(user_id, valor, fonte, descricao, conta_id=conta_id_r)
             resp = f"💵 Receita anotada!\n+R$ {valor:.2f} — {fonte}"
             if descricao:
                 resp += f"\n📝 {descricao}"
+            if conta_id_r:
+                conta_obj_r = buscar_conta(user_id, conta_id=conta_id_r)
+                if conta_obj_r:
+                    resp += f"\n🏦 {conta_obj_r[1]}"
             saldo = total_receita_mes(user_id) - total_gasto_mes(user_id)
             resp += f"\n\n💰 Saldo do mês: R$ {saldo:.2f}"
             m = status_meta_texto(user_id)
@@ -4039,20 +4612,62 @@ def processar_mensagem(message):
                 )
 
         elif intencao == "ajustar_saldo":
-            novo_saldo_desejado = parse_valor(dados.get("valor"))
-            saldo_atual = total_receita_mes(user_id) - total_gasto_mes(user_id)
-            diferenca = novo_saldo_desejado - saldo_atual
+            # 3 modos: 'definir' (set saldo PARA valor), 'somar' (entrada extra),
+            # 'subtrair' (saída extra). Default = 'definir'. Resolve conta primeiro.
+            modo = (dados.get("modo_ajuste") or dados.get("modo") or "definir").strip().lower()
+            valor = parse_valor(dados.get("valor"))
+            if valor < 0:
+                bot.reply_to(message, "Valor inválido pra ajuste de saldo.")
+                return
+            # Conta opcional — se passar, ajuste só afeta saldo daquela conta
+            conta_id_ajuste = None
+            conta_nome_ajuste = (dados.get("conta") or "").strip()
+            if conta_nome_ajuste:
+                status_c, conta_id_ajuste, conta_obj = resolver_conta(user_id, conta_nome_ajuste)
+                if status_c == "ambigua":
+                    nomes = ", ".join(c[1] for c in conta_obj)
+                    bot.reply_to(message, f"Você tem várias contas com esse nome ({nomes}). Seja mais específico.")
+                    return
+                if status_c == "nao_encontrada":
+                    bot.reply_to(message, f"Não achei conta chamada *{conta_nome_ajuste}*. Use /contas pra ver.", parse_mode="Markdown")
+                    return
+            sufixo_conta = ""
+            if conta_id_ajuste:
+                conta_obj = buscar_conta(user_id, conta_id=conta_id_ajuste)
+                sufixo_conta = f" na conta {conta_obj[1]}" if conta_obj else ""
 
-            if diferenca > 0:
-                # O saldo atual é menor que o desejado, então adicionamos uma receita compensatória
-                salvar_receita(user_id, diferenca, "Ajuste de Saldo", "Ajuste manual do sistema")
-                bot.reply_to(message, f"⚖️ Entendido! Lancei uma entrada de R$ {diferenca:.2f} para o seu saldo bater exatamente os R$ {novo_saldo_desejado:.2f} que você pediu.")
-            elif diferenca < 0:
-                # O saldo atual é maior, então adicionamos um gasto compensatório
-                salvar_gasto(user_id, abs(diferenca), "Ajuste de Saldo", "Ajuste manual do sistema", metodo_pagamento="Outros")
-                bot.reply_to(message, f"⚖️ Entendido! Lancei uma saída de R$ {abs(diferenca):.2f} para o seu saldo bater exatamente os R$ {novo_saldo_desejado:.2f}.")
+            if modo in ("somar", "soma", "adicionar", "adiciona", "entrada", "credito", "crédito", "+"):
+                if valor == 0:
+                    bot.reply_to(message, "Valor zero não muda nada no saldo.")
+                    return
+                salvar_receita(user_id, valor, "Ajuste de Saldo", "Ajuste manual do sistema (entrada)", conta_id=conta_id_ajuste)
+                novo = total_receita_mes(user_id, conta_id=conta_id_ajuste) - total_gasto_mes(user_id, conta_id=conta_id_ajuste) if conta_id_ajuste else total_receita_mes(user_id) - total_gasto_mes(user_id)
+                bot.reply_to(message, f"⚖️ Entrada extra de R$ {valor:.2f} lançada{sufixo_conta}.\n💰 Saldo do mês agora: R$ {novo:.2f}")
+            elif modo in ("subtrair", "subtrai", "tirar", "tira", "remover", "remove", "saída", "saida", "debito", "débito", "-"):
+                if valor == 0:
+                    bot.reply_to(message, "Valor zero não muda nada no saldo.")
+                    return
+                salvar_gasto(user_id, valor, "Ajuste de Saldo", "Ajuste manual do sistema (saída)",
+                             metodo_pagamento="Outros", conta_id=conta_id_ajuste)
+                novo = (total_receita_mes(user_id, conta_id=conta_id_ajuste) - total_gasto_mes(user_id, conta_id=conta_id_ajuste)) if conta_id_ajuste else (total_receita_mes(user_id) - total_gasto_mes(user_id))
+                bot.reply_to(message, f"⚖️ Saída extra de R$ {valor:.2f} lançada{sufixo_conta}.\n💰 Saldo do mês agora: R$ {novo:.2f}")
             else:
-                bot.reply_to(message, f"O seu saldo já está exatamente em R$ {novo_saldo_desejado:.2f}! Nenhuma alteração foi necessária. 😉")
+                # modo == "definir" → forçar saldo a valor exato
+                novo_saldo_desejado = valor
+                if conta_id_ajuste:
+                    saldo_atual = total_receita_mes(user_id, conta_id=conta_id_ajuste) - total_gasto_mes(user_id, conta_id=conta_id_ajuste)
+                else:
+                    saldo_atual = total_receita_mes(user_id) - total_gasto_mes(user_id)
+                diferenca = novo_saldo_desejado - saldo_atual
+                if diferenca > 0:
+                    salvar_receita(user_id, diferenca, "Ajuste de Saldo", "Ajuste manual do sistema", conta_id=conta_id_ajuste)
+                    bot.reply_to(message, f"⚖️ Lancei uma entrada de R$ {diferenca:.2f}{sufixo_conta} pra fechar o saldo em R$ {novo_saldo_desejado:.2f}.")
+                elif diferenca < 0:
+                    salvar_gasto(user_id, abs(diferenca), "Ajuste de Saldo", "Ajuste manual do sistema",
+                                 metodo_pagamento="Outros", conta_id=conta_id_ajuste)
+                    bot.reply_to(message, f"⚖️ Lancei uma saída de R$ {abs(diferenca):.2f}{sufixo_conta} pra fechar o saldo em R$ {novo_saldo_desejado:.2f}.")
+                else:
+                    bot.reply_to(message, f"O seu saldo{sufixo_conta} já está exatamente em R$ {novo_saldo_desejado:.2f}, não precisa ajustar.")
 
         elif intencao == "definir_orcamento":
             valor = parse_valor(dados.get("valor"))
@@ -4115,10 +4730,20 @@ def processar_mensagem(message):
             if dia is None:
                 bot.reply_to(message, "Em qual dia do mês esse gasto cai? (1-31).")
                 return
-            adicionar_gasto_fixo(user_id, descricao, valor, categoria, dia)
+            conta_id_gf = _resolver_conta_intent(user_id, dados.get("conta"), message)
+            if conta_id_gf is False:
+                return
+            adicionar_gasto_fixo(user_id, descricao, valor, categoria, dia, conta_id=conta_id_gf)
+            extra_gf = ""
+            if conta_id_gf:
+                conta_obj_gf = buscar_conta(user_id, conta_id=conta_id_gf)
+                if conta_obj_gf:
+                    extra_gf = f"\n• Sai da conta *{escape_md(conta_obj_gf[1])}*."
             bot.reply_to(
                 message,
-                f"📌 Gasto fixo cadastrado!\n• {descricao} — R$ {valor:.2f} ({categoria})\n• Lança automaticamente todo dia {dia:02d}.",
+                f"📌 Gasto fixo cadastrado!\n• {descricao} — R$ {valor:.2f} ({categoria})\n"
+                f"• Lança automaticamente todo dia {dia:02d}.{extra_gf}",
+                parse_mode="Markdown",
             )
 
         elif intencao == "listar_gastos_fixos":
@@ -4179,7 +4804,12 @@ def processar_mensagem(message):
                 if cartao_obj:
                     cartao_id = cartao_obj[0]
 
-            vp = adicionar_parcelamento(user_id, descricao, valor_total, total_parcelas, dia, categoria, metodo, cartao_id=cartao_id)
+            conta_id_pc = _resolver_conta_intent(user_id, dados.get("conta"), message)
+            if conta_id_pc is False:
+                return
+
+            vp = adicionar_parcelamento(user_id, descricao, valor_total, total_parcelas, dia,
+                                        categoria, metodo, cartao_id=cartao_id, conta_id=conta_id_pc)
             resp = (
                 f"💳 Parcelamento cadastrado!\n"
                 f"• {escape_md(descricao)} — R$ {valor_total:.2f} em {total_parcelas}x de R$ {vp:.2f}\n"
@@ -4190,6 +4820,10 @@ def processar_mensagem(message):
             elif metodo == "Crédito":
                 resp += (f"• ⚠️ Não vinculei a nenhum cartão (não cadastrou ou são vários — "
                          f"as parcelas vão como gasto comum).\n")
+            if conta_id_pc:
+                conta_obj_pc = buscar_conta(user_id, conta_id=conta_id_pc)
+                if conta_obj_pc:
+                    resp += f"• Conta: *{escape_md(conta_obj_pc[1])}*\n"
             resp += "• 1ª parcela já lançada."
             bot.reply_to(message, resp, parse_mode="Markdown")
 
@@ -4565,6 +5199,182 @@ def processar_mensagem(message):
         elif intencao == "desativar_lembrete":
             definir_lembrete(user_id, False)
             bot.reply_to(message, "🔕 Lembretes diários desativados. Pode reativar a qualquer momento dizendo 'ativa lembrete'.")
+
+        # ========== CONTAS BANCÁRIAS (multi-conta) ==========
+        elif intencao == "criar_conta":
+            nome = _s(dados.get("conta") or dados.get("banco_nome") or "").strip()
+            if not nome:
+                bot.reply_to(message, "Qual o nome da conta? Ex: 'cria uma conta Nubank'.")
+                return
+            if buscar_conta(user_id, nome=nome):
+                bot.reply_to(message, f"Você já tem uma conta chamada *{escape_md(nome)}*.", parse_mode="Markdown")
+                return
+            banco = _s(dados.get("banco_nome") or "").strip() or nome
+            tipo = _s(dados.get("tipo_conta") or "").strip()
+            cid = criar_conta(user_id, nome, banco=banco, tipo=tipo)
+            bot.reply_to(
+                message,
+                f"🏦 Conta *{escape_md(nome)}* cadastrada (#{cid}, {normalizar_tipo_conta(tipo)})!\n"
+                f"Agora pode dizer coisas como: 'gastei 50 no mercado pelo {escape_md(nome)}'.",
+                parse_mode="Markdown",
+            )
+
+        elif intencao == "listar_contas":
+            contas = listar_contas(user_id)
+            if not contas:
+                bot.reply_to(
+                    message,
+                    "Você ainda não cadastrou nenhuma conta. Cadastre dizendo 'cria uma conta Nubank' "
+                    "ou via /conta_nova.\n\n"
+                    "Lançamentos sem conta vão pra pilha *Geral* — continuam funcionando normalmente.",
+                    parse_mode="Markdown",
+                )
+                return
+            texto = "🏦 *Suas contas:*\n"
+            for cid, nome, banco, tipo, _criado in contas:
+                saldo = saldo_conta(user_id, cid)
+                detalhes = tipo or "Conta"
+                if banco and banco.lower() != nome.lower():
+                    detalhes += f" · {banco}"
+                texto += f"\n• #{cid} *{escape_md(nome)}* ({detalhes})\n  Saldo do mês: R$ {saldo:.2f}"
+            saldo_geral_sem_conta = saldo_conta(user_id, None) - sum(
+                saldo_conta(user_id, c[0]) for c in contas
+            )
+            texto += f"\n\n_Geral (sem conta específica): R$ {saldo_geral_sem_conta:.2f}_"
+            bot.reply_to(message, texto, parse_mode="Markdown")
+
+        elif intencao == "remover_conta":
+            nome = _s(dados.get("conta") or "").strip()
+            if not nome:
+                bot.reply_to(message, "Qual conta você quer remover? Ex: 'remove a conta Nubank'.")
+                return
+            cid = _resolver_conta_intent(user_id, nome, message)
+            if cid is False:
+                return
+            if cid is None:
+                bot.reply_to(message, "Você não tem essa conta cadastrada.")
+                return
+            n_lanc = contar_lancamentos_conta(user_id, cid)
+            obj = buscar_conta(user_id, conta_id=cid)
+            set_pendente(user_id, "remover_conta", {"conta_id": cid, "nome": obj[1] if obj else nome})
+            aviso = ""
+            if n_lanc:
+                aviso = f"\n\n⚠️ Essa conta tem {n_lanc} lançamento(s). Eles vão virar 'Geral' (sem conta) — *não* serão apagados."
+            bot.reply_to(
+                message,
+                f"⚠️ Confirmar: remover a conta *{escape_md(obj[1] if obj else nome)}*?{aviso}\n\n"
+                f"Responde *sim* pra confirmar ou *não* pra cancelar.",
+                parse_mode="Markdown",
+            )
+
+        elif intencao == "renomear_conta":
+            nome = _s(dados.get("conta") or "").strip()
+            if not nome:
+                bot.reply_to(message, "Qual conta você quer alterar? Ex: 'renomeia o nubank pra Nu'.")
+                return
+            cid = _resolver_conta_intent(user_id, nome, message)
+            if cid is False:
+                return
+            if cid is None:
+                bot.reply_to(message, "Você não tem essa conta cadastrada.")
+                return
+            novo_nome = _s(dados.get("novo_conta_nome") or "").strip() or None
+            novo_banco = dados.get("banco_nome")
+            novo_banco = _s(novo_banco).strip() if novo_banco is not None else None
+            novo_tipo = _s(dados.get("tipo_conta") or "").strip() or None
+            if not (novo_nome or novo_banco or novo_tipo):
+                bot.reply_to(message, "O que você quer mudar? Diz: 'renomeia X pra Y' ou 'muda o tipo de X pra poupança'.")
+                return
+            if novo_nome and buscar_conta(user_id, nome=novo_nome):
+                bot.reply_to(message, f"Já existe uma conta chamada *{escape_md(novo_nome)}*. Escolhe outro nome.", parse_mode="Markdown")
+                return
+            renomear_conta(user_id, cid, novo_nome=novo_nome, novo_banco=novo_banco, novo_tipo=novo_tipo)
+            obj = buscar_conta(user_id, conta_id=cid)
+            bot.reply_to(
+                message,
+                f"✅ Conta atualizada!\n• Nome: *{escape_md(obj[1])}*\n"
+                f"• Tipo: {obj[3] or '—'}\n• Banco: {obj[2] or '—'}",
+                parse_mode="Markdown",
+            )
+
+        elif intencao == "transferir_conta":
+            valor = parse_valor(dados.get("valor"))
+            if valor <= 0:
+                bot.reply_to(message, "Qual valor da transferência?")
+                return
+            origem = _s(dados.get("conta") or "").strip()
+            destino = _s(dados.get("conta_destino") or "").strip()
+            if not origem or not destino:
+                bot.reply_to(message, "Diga origem e destino. Ex: 'transferi 500 do nubank pro itau'.")
+                return
+            cid_origem = _resolver_conta_intent(user_id, origem, message)
+            if cid_origem is False:
+                return
+            cid_destino = _resolver_conta_intent(user_id, destino, message)
+            if cid_destino is False:
+                return
+            if cid_origem is None or cid_destino is None:
+                bot.reply_to(message, "Não achei uma das contas. Use /contas pra ver.")
+                return
+            if cid_origem == cid_destino:
+                bot.reply_to(message, "Origem e destino são a mesma conta. 🤔")
+                return
+            transferir_entre_contas(user_id, cid_origem, cid_destino, valor)
+            obj_o = buscar_conta(user_id, conta_id=cid_origem)
+            obj_d = buscar_conta(user_id, conta_id=cid_destino)
+            saldo_o = saldo_conta(user_id, cid_origem)
+            saldo_d = saldo_conta(user_id, cid_destino)
+            bot.reply_to(
+                message,
+                f"🔁 Transferência de R$ {valor:.2f}:\n"
+                f"➖ {escape_md(obj_o[1])}: R$ {saldo_o:.2f}\n"
+                f"➕ {escape_md(obj_d[1])}: R$ {saldo_d:.2f}",
+                parse_mode="Markdown",
+            )
+
+        elif intencao == "consultar_saldo":
+            nome = _s(dados.get("conta") or "").strip()
+            if nome:
+                cid = _resolver_conta_intent(user_id, nome, message)
+                if cid is False:
+                    return
+                if cid is None:
+                    saldo_g = total_receita_mes(user_id) - total_gasto_mes(user_id)
+                    bot.reply_to(message, f"💰 Saldo geral do mês: R$ {saldo_g:.2f}")
+                    return
+                obj = buscar_conta(user_id, conta_id=cid)
+                rec = total_receita_mes(user_id, conta_id=cid)
+                gas = total_gasto_mes(user_id, conta_id=cid)
+                saldo = rec - gas
+                bot.reply_to(
+                    message,
+                    f"🏦 *{escape_md(obj[1])}* — saldo do mês\n"
+                    f"➕ Entradas: R$ {rec:.2f}\n"
+                    f"➖ Saídas: R$ {gas:.2f}\n"
+                    f"💰 Saldo: R$ {saldo:.2f}",
+                    parse_mode="Markdown",
+                )
+            else:
+                contas = listar_contas(user_id)
+                rec_geral = total_receita_mes(user_id)
+                gas_geral = total_gasto_mes(user_id)
+                texto = (
+                    f"💰 *Saldo do mês ({fmt_mes(mes_atual())})*\n"
+                    f"➕ Entradas: R$ {rec_geral:.2f}\n"
+                    f"➖ Saídas: R$ {gas_geral:.2f}\n"
+                    f"━━━━━━━━━━━━━━━━━\n"
+                    f"💵 Saldo total: R$ {rec_geral - gas_geral:.2f}"
+                )
+                if contas:
+                    texto += "\n\n*Por conta:*"
+                    soma_contas = 0.0
+                    for cid, nome_c, _b, _t, _c in contas:
+                        s = saldo_conta(user_id, cid)
+                        soma_contas += s
+                        texto += f"\n• {escape_md(nome_c)}: R$ {s:.2f}"
+                    geral_sem_conta = (rec_geral - gas_geral) - soma_contas
+                    texto += f"\n• _Geral (sem conta): R$ {geral_sem_conta:.2f}_"
+                bot.reply_to(message, texto, parse_mode="Markdown")
 
         else:
             resposta = dados.get("resposta") or "Pode me contar mais? Posso anotar gastos e receitas, definir orçamento, metas ou mostrar relatórios."
