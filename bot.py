@@ -3034,12 +3034,15 @@ def cmd_contas(message):
         )
         return
     texto = "🏦 *Suas contas:*\n"
+    saldo_total = 0.0
     for cid, nome, banco, tipo, _criado in contas:
         saldo = saldo_conta(user_id, cid)
+        saldo_total += saldo
         detalhes = tipo or "Conta"
         if banco and banco.lower() != nome.lower():
             detalhes += f" · {banco}"
         texto += f"\n• #{cid} *{escape_md(nome)}* ({detalhes})\n  Saldo atual: R$ {saldo:.2f}"
+    texto += f"\n\n💰 *Total: R$ {saldo_total:.2f}*"
     bot.reply_to(message, texto, parse_mode="Markdown")
 
 
@@ -3133,9 +3136,7 @@ def cmd_saldo(message):
     contas = listar_contas(user_id)
     rec_geral = total_receita_mes(user_id)
     gas_geral = total_gasto_mes(user_id)
-    saldo_total_contas = sum(saldo_conta(user_id, c[0]) for c in contas)
-    saldo_geral_sem_conta = saldo_conta(user_id, None)
-    saldo_total = saldo_total_contas + saldo_geral_sem_conta
+    saldo_total = sum(saldo_conta(user_id, c[0]) for c in contas)
     texto = (
         f"💰 *Saldo total: R$ {saldo_total:.2f}*\n"
         f"━━━━━━━━━━━━━━━━━\n"
@@ -3147,8 +3148,6 @@ def cmd_saldo(message):
         for cid, nome_c, _b, _t, _c in contas:
             s = saldo_conta(user_id, cid)
             texto += f"\n• {escape_md(nome_c)}: R$ {s:.2f}"
-        if saldo_geral_sem_conta != 0:
-            texto += f"\n• _Geral (sem conta): R$ {saldo_geral_sem_conta:.2f}_"
     bot.reply_to(message, texto, parse_mode="Markdown")
 
 
@@ -3581,10 +3580,8 @@ def gerar_relatorio(message, completo=None):
     if not completo:
         contas = listar_contas(user_id)
 
-        # Saldo total = soma de todas as contas (acumulado real)
-        saldo_total_contas = sum(saldo_conta(user_id, c[0]) for c in contas)
-        saldo_geral_sem_conta = saldo_conta(user_id, None)
-        saldo_total = saldo_total_contas + saldo_geral_sem_conta
+        # Saldo total = soma apenas das contas cadastradas
+        saldo_total = sum(saldo_conta(user_id, c[0]) for c in contas)
 
         texto = f"📊 *Resumo de {fmt_mes(mes)}*\n\n"
         texto += f"📅 *Esse mês:*\n"
@@ -3603,8 +3600,6 @@ def gerar_relatorio(message, completo=None):
             for cid, nome_c, _b, _t, _c in contas:
                 s = saldo_conta(user_id, cid)
                 texto += f"• {escape_md(nome_c)}: R$ {s:.2f}\n"
-            if saldo_geral_sem_conta != 0:
-                texto += f"• _Geral (sem conta): R$ {saldo_geral_sem_conta:.2f}_\n"
 
         texto += "\n_Quer o extrato completo? Diga 'relatório completo'._"
         conn.close()
@@ -3656,9 +3651,7 @@ def gerar_relatorio(message, completo=None):
         conn2.close()
 
     contas = listar_contas(user_id)
-    saldo_total_contas = sum(saldo_conta(user_id, c[0]) for c in contas)
-    saldo_geral_sem_conta = saldo_conta(user_id, None)
-    saldo_total = saldo_total_contas + saldo_geral_sem_conta
+    saldo_total = sum(saldo_conta(user_id, c[0]) for c in contas)
     saldo_previsto_fim = saldo_total - gastos_futuros
     saldo_realista = saldo_total - fatura_total
 
@@ -3682,8 +3675,6 @@ def gerar_relatorio(message, completo=None):
         for cid, nome_c, _b, _t, _c in contas:
             s = saldo_conta(user_id, cid)
             texto += f"• {escape_md(nome_c)}: R$ {s:.2f}\n"
-        if saldo_geral_sem_conta != 0:
-            texto += f"• _Geral (sem conta): R$ {saldo_geral_sem_conta:.2f}_\n"
 
     if detalhe_cartoes:
         texto += "\n💳 *DETALHAMENTO DE CARTÕES*\n"
@@ -5358,14 +5349,15 @@ def processar_mensagem(message):
                 )
                 return
             texto = "🏦 *Suas contas:*\n"
+            saldo_total = 0.0
             for cid, nome, banco, tipo, _criado in contas:
                 saldo = saldo_conta(user_id, cid)
+                saldo_total += saldo
                 detalhes = tipo or "Conta"
                 if banco and banco.lower() != nome.lower():
                     detalhes += f" · {banco}"
                 texto += f"\n• #{cid} *{escape_md(nome)}* ({detalhes})\n  Saldo atual: R$ {saldo:.2f}"
-            saldo_geral_sem_conta = saldo_conta(user_id, None)
-            texto += f"\n\n_Geral (sem conta específica): R$ {saldo_geral_sem_conta:.2f}_"
+            texto += f"\n\n💰 *Total: R$ {saldo_total:.2f}*"
             bot.reply_to(message, texto, parse_mode="Markdown")
 
         elif intencao == "remover_conta":
@@ -5493,9 +5485,7 @@ def processar_mensagem(message):
                 contas = listar_contas(user_id)
                 rec_geral = total_receita_mes(user_id)
                 gas_geral = total_gasto_mes(user_id)
-                saldo_total_c = sum(saldo_conta(user_id, c[0]) for c in contas)
-                saldo_geral_sc = saldo_conta(user_id, None)
-                saldo_total = saldo_total_c + saldo_geral_sc
+                saldo_total = sum(saldo_conta(user_id, c[0]) for c in contas)
                 texto = (
                     f"💰 *Saldo total: R$ {saldo_total:.2f}*\n"
                     f"━━━━━━━━━━━━━━━━━\n"
@@ -5508,8 +5498,6 @@ def processar_mensagem(message):
                     for cid, nome_c, _b, _t, _c in contas:
                         s = saldo_conta(user_id, cid)
                         texto += f"\n• {escape_md(nome_c)}: R$ {s:.2f}"
-                    if saldo_geral_sc != 0:
-                        texto += f"\n• _Geral (sem conta): R$ {saldo_geral_sc:.2f}_"
                 bot.reply_to(message, texto, parse_mode="Markdown")
 
         else:
