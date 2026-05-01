@@ -23,7 +23,7 @@ MODEL_FALLBACK = "gemini-2.5-flash"
 
 # Versão da SYSTEM_INSTRUCTION. Bump esse número sempre que o prompt mudar
 # pra invalidar sessões já abertas e o Gemini reler o prompt novo.
-SYSTEM_INSTRUCTION_VERSION = "v4"
+SYSTEM_INSTRUCTION_VERSION = "v5"
 
 # user_id -> (versao_prompt, chat_session)
 memoria_usuarios = {}
@@ -3133,17 +3133,22 @@ def cmd_saldo(message):
     contas = listar_contas(user_id)
     rec_geral = total_receita_mes(user_id)
     gas_geral = total_gasto_mes(user_id)
+    saldo_total_contas = sum(saldo_conta(user_id, c[0]) for c in contas)
+    saldo_geral_sem_conta = saldo_conta(user_id, None)
+    saldo_total = saldo_total_contas + saldo_geral_sem_conta
     texto = (
-        f"💰 *Saldo do mês ({fmt_mes(mes_atual())})*\n"
-        f"➕ Entradas: R$ {rec_geral:.2f}\n➖ Saídas: R$ {gas_geral:.2f}\n"
-        f"━━━━━━━━━━━━━━━━━\n💵 Saldo do mês: R$ {rec_geral - gas_geral:.2f}"
+        f"💰 *Saldo total: R$ {saldo_total:.2f}*\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"📅 Esse mês ({fmt_mes(mes_atual())}):\n"
+        f"  ➕ Entradas: R$ {rec_geral:.2f}\n  ➖ Saídas: R$ {gas_geral:.2f}"
     )
     if contas:
-        texto += "\n\n*Saldo atual das contas:*"
+        texto += "\n\n*Por conta:*"
         for cid, nome_c, _b, _t, _c in contas:
             s = saldo_conta(user_id, cid)
             texto += f"\n• {escape_md(nome_c)}: R$ {s:.2f}"
-        texto += f"\n• _Geral (sem conta): R$ {saldo_conta(user_id, None):.2f}_"
+        if saldo_geral_sem_conta != 0:
+            texto += f"\n• _Geral (sem conta): R$ {saldo_geral_sem_conta:.2f}_"
     bot.reply_to(message, texto, parse_mode="Markdown")
 
 
@@ -3574,23 +3579,32 @@ def gerar_relatorio(message, completo=None):
 
     # ── VERSÃO SIMPLES (padrão) ────────────────────────────────────────────
     if not completo:
+        contas = listar_contas(user_id)
+
+        # Saldo total = soma de todas as contas (acumulado real)
+        saldo_total_contas = sum(saldo_conta(user_id, c[0]) for c in contas)
+        saldo_geral_sem_conta = saldo_conta(user_id, None)
+        saldo_total = saldo_total_contas + saldo_geral_sem_conta
+
         texto = f"📊 *Resumo de {fmt_mes(mes)}*\n\n"
-        texto += f"💵 Receitas: *R$ {receitas_mes:.2f}*\n"
-        texto += f"💸 Gastos: *R$ {gastos_reais:.2f}*\n"
+        texto += f"📅 *Esse mês:*\n"
+        texto += f"💵 Receitas: R$ {receitas_mes:.2f}\n"
+        texto += f"💸 Gastos: R$ {gastos_reais:.2f}\n"
         if gastos_futuros > 0:
             texto += f"⏳ Gastos futuros: R$ {gastos_futuros:.2f}\n"
         if fatura_total > 0:
             texto += f"💳 Fatura aberta: R$ {fatura_total:.2f}\n"
-        texto += f"\n💰 Saldo do mês: *R$ {saldo_mes:.2f}*\n"
+        texto += f"\n💰 *Saldo total: R$ {saldo_total:.2f}*\n"
         if gastos_futuros > 0:
             texto += f"🔮 Previsto fim do mês: R$ {saldo_previsto:.2f}\n"
 
-        contas = listar_contas(user_id)
         if contas:
             texto += "\n🏦 *Saldo das contas:*\n"
             for cid, nome_c, _b, _t, _c in contas:
                 s = saldo_conta(user_id, cid)
                 texto += f"• {escape_md(nome_c)}: R$ {s:.2f}\n"
+            if saldo_geral_sem_conta != 0:
+                texto += f"• _Geral (sem conta): R$ {saldo_geral_sem_conta:.2f}_\n"
 
         texto += "\n_Quer o extrato completo? Diga 'relatório completo'._"
         conn.close()
@@ -3641,26 +3655,35 @@ def gerar_relatorio(message, completo=None):
                 detalhe_cartoes.append((nome_c, comp_mes, total_aberta))
         conn2.close()
 
-    saldo_realista = saldo_mes - fatura_total
+    contas = listar_contas(user_id)
+    saldo_total_contas = sum(saldo_conta(user_id, c[0]) for c in contas)
+    saldo_geral_sem_conta = saldo_conta(user_id, None)
+    saldo_total = saldo_total_contas + saldo_geral_sem_conta
+    saldo_previsto_fim = saldo_total - gastos_futuros
+    saldo_realista = saldo_total - fatura_total
 
     texto = f"📊 *Extrato Completo — {fmt_mes(mes)}*\n"
-    texto += f"💵 *Receitas:* R$ {receitas_mes:.2f}\n"
-    texto += f"💸 *Gastos realizados:* R$ {gastos_reais:.2f}\n"
-    texto += f"⏳ *Gastos futuros:* R$ {gastos_futuros:.2f}\n"
+    texto += f"\n📅 *Esse mês:*\n"
+    texto += f"💵 Receitas: R$ {receitas_mes:.2f}\n"
+    texto += f"💸 Gastos realizados: R$ {gastos_reais:.2f}\n"
+    if gastos_futuros > 0:
+        texto += f"⏳ Gastos futuros: R$ {gastos_futuros:.2f}\n"
     if cartao_mes_total > 0 or fatura_total > 0:
-        texto += f"💳 *Compras no cartão (mês):* R$ {cartao_mes_total:.2f}\n"
-        texto += f"💳 *Fatura(s) em aberto:* R$ {fatura_total:.2f}\n"
-    texto += f"\n💰 *Saldo Atual:* R$ {saldo_mes:.2f}\n"
-    texto += f"🔮 *Saldo Previsto (fim do mês):* R$ {saldo_previsto:.2f}\n"
+        texto += f"💳 Compras no cartão (mês): R$ {cartao_mes_total:.2f}\n"
+        texto += f"💳 Fatura(s) em aberto: R$ {fatura_total:.2f}\n"
+    texto += f"\n💰 *Saldo total: R$ {saldo_total:.2f}*\n"
+    if gastos_futuros > 0:
+        texto += f"🔮 Previsto fim do mês: R$ {saldo_previsto_fim:.2f}\n"
     if fatura_total > 0:
-        texto += f"💎 *Saldo Realista (sem dívida cartão):* R$ {saldo_realista:.2f}\n"
+        texto += f"💎 Realista (sem dívida cartão): R$ {saldo_realista:.2f}\n"
 
-    contas = listar_contas(user_id)
     if contas:
         texto += "\n🏦 *Saldo atual das contas:*\n"
         for cid, nome_c, _b, _t, _c in contas:
             s = saldo_conta(user_id, cid)
             texto += f"• {escape_md(nome_c)}: R$ {s:.2f}\n"
+        if saldo_geral_sem_conta != 0:
+            texto += f"• _Geral (sem conta): R$ {saldo_geral_sem_conta:.2f}_\n"
 
     if detalhe_cartoes:
         texto += "\n💳 *DETALHAMENTO DE CARTÕES*\n"
@@ -3865,13 +3888,22 @@ Classifique a mensagem em UMA das intenções:
 - "cancelar": usuário cancela a ação pendente ("não", "cancela", "deixa quieto", "esquece").
 
 # CONTAS BANCÁRIAS (multi-conta) =========================================
-# O usuário pode ter VÁRIAS contas (Nubank, Itaú, Caixa, etc.) e querer separar
+# O usuário pode ter VÁRIAS contas (Nubank, Itaú, Flash, etc.) e querer separar
 # o dinheiro por conta. Em QUALQUER intenção de movimentação (registrar_gasto,
 # registrar_receita, registrar_gasto_credito, registrar_investimento,
 # adicionar_gasto_fixo, adicionar_receita_fixa, adicionar_parcelamento, ajustar_saldo)
-# se o usuário disser de qual conta saiu/entrou ("paguei 50 no mercado pelo nubank",
-# "salário 3000 caiu na conta itau", "tirei 100 do santander"), preencha "conta"
+# se o usuário mencionar de qual conta saiu/entrou o dinheiro, preencha "conta"
 # com o nome do banco/conta. Se ele NÃO disser, deixe "conta" vazio.
+#
+# PADRÕES COMUNS para identificar a conta:
+#   "paguei 50 no mercado pelo nubank"       → conta: "nubank"
+#   "gastei 30 no ifood no flash"            → conta: "flash"
+#   "gastei 5 com chiclete no flash"         → conta: "flash"  ← "no [banco]" no FIM da frase = conta
+#   "salário 3000 caiu na conta itau"        → conta: "itau"
+#   "tirei 100 do santander"                 → conta: "santander"
+#   "uber 20 no débito nubank"               → conta: "nubank"
+# ATENÇÃO: "no [nome_banco]" ao FINAL de uma frase de gasto quase sempre indica
+# a conta usada, NÃO o estabelecimento. Priorize a conta cadastrada.
 
 - "criar_conta": usuário quer cadastrar uma nova conta bancária
   (ex: "cria uma conta nubank", "adiciona o banco itau", "nova conta santander corrente",
@@ -5461,19 +5493,23 @@ def processar_mensagem(message):
                 contas = listar_contas(user_id)
                 rec_geral = total_receita_mes(user_id)
                 gas_geral = total_gasto_mes(user_id)
+                saldo_total_c = sum(saldo_conta(user_id, c[0]) for c in contas)
+                saldo_geral_sc = saldo_conta(user_id, None)
+                saldo_total = saldo_total_c + saldo_geral_sc
                 texto = (
-                    f"💰 *Saldo do mês ({fmt_mes(mes_atual())})*\n"
-                    f"➕ Entradas: R$ {rec_geral:.2f}\n"
-                    f"➖ Saídas: R$ {gas_geral:.2f}\n"
+                    f"💰 *Saldo total: R$ {saldo_total:.2f}*\n"
                     f"━━━━━━━━━━━━━━━━━\n"
-                    f"💵 Saldo do mês: R$ {rec_geral - gas_geral:.2f}"
+                    f"📅 Esse mês ({fmt_mes(mes_atual())}):\n"
+                    f"  ➕ Entradas: R$ {rec_geral:.2f}\n"
+                    f"  ➖ Saídas: R$ {gas_geral:.2f}"
                 )
                 if contas:
-                    texto += "\n\n*Saldo atual das contas:*"
+                    texto += "\n\n*Por conta:*"
                     for cid, nome_c, _b, _t, _c in contas:
                         s = saldo_conta(user_id, cid)
                         texto += f"\n• {escape_md(nome_c)}: R$ {s:.2f}"
-                    texto += f"\n• _Geral (sem conta): R$ {saldo_conta(user_id, None):.2f}_"
+                    if saldo_geral_sc != 0:
+                        texto += f"\n• _Geral (sem conta): R$ {saldo_geral_sc:.2f}_"
                 bot.reply_to(message, texto, parse_mode="Markdown")
 
         else:
