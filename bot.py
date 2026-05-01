@@ -23,7 +23,7 @@ MODEL_FALLBACK = "gemini-2.5-flash"
 
 # Versão da SYSTEM_INSTRUCTION. Bump esse número sempre que o prompt mudar
 # pra invalidar sessões já abertas e o Gemini reler o prompt novo.
-SYSTEM_INSTRUCTION_VERSION = "v3"
+SYSTEM_INSTRUCTION_VERSION = "v4"
 
 # user_id -> (versao_prompt, chat_session)
 memoria_usuarios = {}
@@ -316,6 +316,10 @@ def criar_banco():
             PRIMARY KEY (user_id, mes)
         )
     """)
+
+    # Migração: saldo base persistente por conta (persiste entre meses)
+    if not _column_exists(cursor, "contas", "saldo_base"):
+        cursor.execute("ALTER TABLE contas ADD COLUMN saldo_base REAL DEFAULT 0")
 
     conn.commit()
     conn.close()
@@ -818,10 +822,58 @@ def total_receita_mes_conta(user_id, conta_id, mes=None):
     return total_receita_mes(user_id, mes=mes, conta_id=conta_id)
 
 
-def saldo_conta(user_id, conta_id, mes=None):
-    """Saldo do MÊS para uma conta (receitas - gastos do mês). conta_id=None = total geral."""
-    return total_receita_mes(user_id, mes=mes, conta_id=conta_id) - \
-           total_gasto_mes(user_id, mes=mes, conta_id=conta_id)
+def saldo_conta(user_id, conta_id):
+    """Saldo ACUMULADO de uma conta (all-time: saldo_base + todas receitas - todos gastos).
+    Persiste entre meses. conta_id=None → lançamentos sem conta específica (conta_id IS NULL)."""
+    conn = db()
+    if conta_id is None:
+        total_r = conn.execute(
+            "SELECT COALESCE(SUM(valor), 0) FROM receitas WHERE user_id = ? AND conta_id IS NULL",
+            (user_id,),
+        ).fetchone()[0] or 0.0
+        total_g = conn.execute(
+            "SELECT COALESCE(SUM(valor), 0) FROM gastos WHERE user_id = ? AND conta_id IS NULL",
+            (user_id,),
+        ).fetchone()[0] or 0.0
+        conn.close()
+        return total_r - total_g
+    row = conn.execute(
+        "SELECT COALESCE(saldo_base, 0) FROM contas WHERE id = ? AND user_id = ?",
+        (conta_id, user_id),
+    ).fetchone()
+    saldo_base = row[0] if row else 0.0
+    total_r = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM receitas WHERE user_id = ? AND conta_id = ?",
+        (user_id, conta_id),
+    ).fetchone()[0] or 0.0
+    total_g = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM gastos WHERE user_id = ? AND conta_id = ?",
+        (user_id, conta_id),
+    ).fetchone()[0] or 0.0
+    conn.close()
+    return saldo_base + total_r - total_g
+
+
+def definir_saldo_base_conta(user_id, conta_id, novo_saldo_desejado):
+    """Ajusta saldo_base para que saldo_conta() bata com novo_saldo_desejado.
+    Isso garante que o saldo 'real' da conta reflita o valor informado pelo usuário,
+    independente do mês — o saldo persiste e não zera na virada do mês."""
+    conn = db()
+    total_r = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM receitas WHERE user_id = ? AND conta_id = ?",
+        (user_id, conta_id),
+    ).fetchone()[0] or 0.0
+    total_g = conn.execute(
+        "SELECT COALESCE(SUM(valor), 0) FROM gastos WHERE user_id = ? AND conta_id = ?",
+        (user_id, conta_id),
+    ).fetchone()[0] or 0.0
+    novo_base = novo_saldo_desejado - total_r + total_g
+    conn.execute(
+        "UPDATE contas SET saldo_base = ? WHERE id = ? AND user_id = ?",
+        (novo_base, conta_id, user_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def resolver_conta(user_id, conta_nome):
@@ -2987,7 +3039,7 @@ def cmd_contas(message):
         detalhes = tipo or "Conta"
         if banco and banco.lower() != nome.lower():
             detalhes += f" · {banco}"
-        texto += f"\n• #{cid} *{escape_md(nome)}* ({detalhes})\n  Saldo do mês: R$ {saldo:.2f}"
+        texto += f"\n• #{cid} *{escape_md(nome)}* ({detalhes})\n  Saldo atual: R$ {saldo:.2f}"
     bot.reply_to(message, texto, parse_mode="Markdown")
 
 
@@ -3065,12 +3117,16 @@ def cmd_saldo(message):
         if status != "ok":
             bot.reply_to(message, f"Conta *{escape_md(nome_filtro)}* não encontrada.", parse_mode="Markdown")
             return
+        saldo_atual = saldo_conta(user_id, cid)
         rec = total_receita_mes(user_id, conta_id=cid)
         gas = total_gasto_mes(user_id, conta_id=cid)
         bot.reply_to(
             message,
-            f"🏦 *{escape_md(obj[1])}* — saldo do mês\n"
-            f"➕ Entradas: R$ {rec:.2f}\n➖ Saídas: R$ {gas:.2f}\n💰 Saldo: R$ {rec-gas:.2f}",
+            f"🏦 *{escape_md(obj[1])}*\n"
+            f"💰 Saldo atual: *R$ {saldo_atual:.2f}*\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"📅 Este mês ({fmt_mes(mes_atual())}):\n"
+            f"  ➕ Entradas: R$ {rec:.2f}\n  ➖ Saídas: R$ {gas:.2f}",
             parse_mode="Markdown",
         )
         return
@@ -3080,17 +3136,14 @@ def cmd_saldo(message):
     texto = (
         f"💰 *Saldo do mês ({fmt_mes(mes_atual())})*\n"
         f"➕ Entradas: R$ {rec_geral:.2f}\n➖ Saídas: R$ {gas_geral:.2f}\n"
-        f"━━━━━━━━━━━━━━━━━\n💵 Saldo total: R$ {rec_geral - gas_geral:.2f}"
+        f"━━━━━━━━━━━━━━━━━\n💵 Saldo do mês: R$ {rec_geral - gas_geral:.2f}"
     )
     if contas:
-        texto += "\n\n*Por conta:*"
-        soma_contas = 0.0
+        texto += "\n\n*Saldo atual das contas:*"
         for cid, nome_c, _b, _t, _c in contas:
             s = saldo_conta(user_id, cid)
-            soma_contas += s
             texto += f"\n• {escape_md(nome_c)}: R$ {s:.2f}"
-        geral = (rec_geral - gas_geral) - soma_contas
-        texto += f"\n• _Geral (sem conta): R$ {geral:.2f}_"
+        texto += f"\n• _Geral (sem conta): R$ {saldo_conta(user_id, None):.2f}_"
     bot.reply_to(message, texto, parse_mode="Markdown")
 
 
@@ -3472,49 +3525,79 @@ def send_welcome(message):
 
 
 @bot.message_handler(commands=["relatorio"])
-def gerar_relatorio(message):
+def gerar_relatorio(message, completo=None):
+    """Relatório do mês. Por padrão simples; completo=True mostra detalhamento.
+    Se chamado via /relatorio completo (ou variações), força modo detalhado."""
     registrar_usuario(message.chat.id)
     user_id = message.chat.id
+
+    # Detecta se o usuário pediu modo completo via comando slash
+    if completo is None:
+        args = message.text.split(maxsplit=1)
+        arg = args[1].strip().lower() if len(args) > 1 else ""
+        completo = any(p in arg for p in ("completo", "detalhado", "extrato", "tudo", "full", "detalhe"))
+
     agora = datetime.now()
     hoje_str = agora.strftime("%Y-%m-%d %H:%M:%S")
     mes = mes_atual()
-    dia_atual = agora.day
 
     conn = db()
-    
-    # 1. Gastos que já aconteceram (até agora)
+
     gastos_reais = conn.execute(
         "SELECT SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data <= ?",
-        (user_id, mes, hoje_str)
+        (user_id, mes, hoje_str),
     ).fetchone()[0] or 0.0
 
-    # 2. Gastos futuros (lançados com data futura no banco principal)
     gastos_futuros_pontuais = conn.execute(
         "SELECT SUM(valor) FROM gastos WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data > ?",
-        (user_id, mes, hoje_str)
+        (user_id, mes, hoje_str),
     ).fetchone()[0] or 0.0
 
-    # 3. Gastos Fixos que ainda não caíram este mês (Pendentes)
     gastos_fixos_futuros = conn.execute(
-        """SELECT SUM(valor) FROM gastos_fixos 
-           WHERE user_id = ? 
-           AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
-        (user_id, mes)
+        """SELECT SUM(valor) FROM gastos_fixos
+           WHERE user_id = ? AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
+        (user_id, mes),
     ).fetchone()[0] or 0.0
 
-    # 4. Parcelamentos que ainda não caíram este mês (Pendentes)
     parcelas_futuras = conn.execute(
-        """SELECT SUM(valor_parcela) FROM parcelamentos 
-           WHERE user_id = ? AND parcelas_pagas < total_parcelas 
+        """SELECT SUM(valor_parcela) FROM parcelamentos
+           WHERE user_id = ? AND parcelas_pagas < total_parcelas
            AND (ultimo_mes_aplicado IS NULL OR ultimo_mes_aplicado != ?)""",
-        (user_id, mes)
+        (user_id, mes),
     ).fetchone()[0] or 0.0
 
     gastos_futuros = gastos_futuros_pontuais + gastos_fixos_futuros + parcelas_futuras
-    
     receitas_mes = total_receita_mes(user_id, mes)
-    
-    # --- BUSCAS PARA DETALHAMENTO ---
+    fatura_total = total_fatura_aberta_todos_cartoes(user_id)
+    saldo_mes = receitas_mes - gastos_reais
+    saldo_previsto = receitas_mes - (gastos_reais + gastos_futuros)
+
+    # ── VERSÃO SIMPLES (padrão) ────────────────────────────────────────────
+    if not completo:
+        texto = f"📊 *Resumo de {fmt_mes(mes)}*\n\n"
+        texto += f"💵 Receitas: *R$ {receitas_mes:.2f}*\n"
+        texto += f"💸 Gastos: *R$ {gastos_reais:.2f}*\n"
+        if gastos_futuros > 0:
+            texto += f"⏳ Gastos futuros: R$ {gastos_futuros:.2f}\n"
+        if fatura_total > 0:
+            texto += f"💳 Fatura aberta: R$ {fatura_total:.2f}\n"
+        texto += f"\n💰 Saldo do mês: *R$ {saldo_mes:.2f}*\n"
+        if gastos_futuros > 0:
+            texto += f"🔮 Previsto fim do mês: R$ {saldo_previsto:.2f}\n"
+
+        contas = listar_contas(user_id)
+        if contas:
+            texto += "\n🏦 *Saldo das contas:*\n"
+            for cid, nome_c, _b, _t, _c in contas:
+                s = saldo_conta(user_id, cid)
+                texto += f"• {escape_md(nome_c)}: R$ {s:.2f}\n"
+
+        texto += "\n_Quer o extrato completo? Diga 'relatório completo'._"
+        conn.close()
+        bot.reply_to(message, texto, parse_mode="Markdown")
+        return
+
+    # ── VERSÃO COMPLETA (detalhada) ────────────────────────────────────────
     por_categoria = conn.execute(
         """SELECT categoria, SUM(valor) FROM gastos
            WHERE user_id = ? AND strftime('%Y-%m', data) = ? AND data <= ?
@@ -3527,7 +3610,6 @@ def gerar_relatorio(message):
            ORDER BY id DESC LIMIT 10""",
         (user_id, mes, hoje_str),
     ).fetchall()
-    
     por_fonte = conn.execute(
         """SELECT fonte, SUM(valor) FROM receitas
            WHERE user_id = ? AND strftime('%Y-%m', data) = ?
@@ -3542,9 +3624,6 @@ def gerar_relatorio(message):
     ).fetchall()
     conn.close()
 
-    # Faturas em aberto (cartão de crédito) — aparecem como dívida
-    fatura_total = total_fatura_aberta_todos_cartoes(user_id)
-    # Compras no cartão feitas no mês (independente de fatura/pago)
     cartao_mes_total = 0.0
     cartoes_user = listar_cartoes(user_id)
     detalhe_cartoes = []
@@ -3562,22 +3641,26 @@ def gerar_relatorio(message):
                 detalhe_cartoes.append((nome_c, comp_mes, total_aberta))
         conn2.close()
 
-    saldo_atual = receitas_mes - gastos_reais
-    saldo_previsto = receitas_mes - (gastos_reais + gastos_futuros)
-    saldo_realista = saldo_atual - fatura_total  # descontando dívida do cartão
+    saldo_realista = saldo_mes - fatura_total
 
-    # Monta o texto do Extrato
-    texto = f"📊 *Relatório e Extrato de {fmt_mes(mes)}*\n"
+    texto = f"📊 *Extrato Completo — {fmt_mes(mes)}*\n"
     texto += f"💵 *Receitas:* R$ {receitas_mes:.2f}\n"
     texto += f"💸 *Gastos realizados:* R$ {gastos_reais:.2f}\n"
     texto += f"⏳ *Gastos futuros:* R$ {gastos_futuros:.2f}\n"
     if cartao_mes_total > 0 or fatura_total > 0:
         texto += f"💳 *Compras no cartão (mês):* R$ {cartao_mes_total:.2f}\n"
         texto += f"💳 *Fatura(s) em aberto:* R$ {fatura_total:.2f}\n"
-    texto += f"\n💰 *Saldo Atual:* R$ {saldo_atual:.2f}\n"
-    texto += f"🔮 *Saldo Previsto (Final do mês):* R$ {saldo_previsto:.2f}\n"
+    texto += f"\n💰 *Saldo Atual:* R$ {saldo_mes:.2f}\n"
+    texto += f"🔮 *Saldo Previsto (fim do mês):* R$ {saldo_previsto:.2f}\n"
     if fatura_total > 0:
-        texto += f"💎 *Saldo Realista (descontando cartão):* R$ {saldo_realista:.2f}\n"
+        texto += f"💎 *Saldo Realista (sem dívida cartão):* R$ {saldo_realista:.2f}\n"
+
+    contas = listar_contas(user_id)
+    if contas:
+        texto += "\n🏦 *Saldo atual das contas:*\n"
+        for cid, nome_c, _b, _t, _c in contas:
+            s = saldo_conta(user_id, cid)
+            texto += f"• {escape_md(nome_c)}: R$ {s:.2f}\n"
 
     if detalhe_cartoes:
         texto += "\n💳 *DETALHAMENTO DE CARTÕES*\n"
@@ -3691,7 +3774,7 @@ Classifique a mensagem em UMA das intenções:
   Em "dia_mes" o dia de cobrança da fatura (assuma dia 10 se não mencionado).
 - "listar_parcelamentos": ver compras parceladas em andamento.
 - "remover_parcelamento": cancelar parcelamento (extraia "parc_id").
-- "consultar_relatorio": ver extrato, entradas e saídas, detalhamento, saldo, categorias, histórico e relatório.
+- "consultar_relatorio": ver resumo/relatório/extrato do mês. Por padrão mostra versão simples (entradas, saídas, saldo). Se o usuário pedir explicitamente "completo", "detalhado", "extrato completo", "tudo", "categorias", "histórico" ou "últimos lançamentos", coloque "relatorio_completo": true no JSON.
 - "comparar_meses": comparar mês atual com o anterior.
 - "resumo_semanal": ver resumo da semana.
 - "apagar_ultimo": apagar/desfazer o último gasto registrado.
@@ -3839,6 +3922,7 @@ Retorne SEMPRE este JSON:
   "novo_conta_nome": "<novo nome da conta, só pra renomear_conta, ou vazio>",
   "tipo_conta": "<Corrente|Poupança|Digital|Salário|Dinheiro|Outro ou vazio>",
   "banco_nome": "<nome do banco da conta (pra criar_conta/renomear_conta), ou vazio>",
+  "relatorio_completo": <true|false — true só se pediu explicitamente relatório detalhado/completo/extrato; false pra resumo simples>,
   "resposta": "<texto curto e amigável em PT-BR — preencha em 'conversa' ou pra pedir esclarecimento>"
 }
 
@@ -4655,19 +4739,30 @@ def processar_mensagem(message):
                 # modo == "definir" → forçar saldo a valor exato
                 novo_saldo_desejado = valor
                 if conta_id_ajuste:
-                    saldo_atual = total_receita_mes(user_id, conta_id=conta_id_ajuste) - total_gasto_mes(user_id, conta_id=conta_id_ajuste)
+                    # Com conta específica: ajusta saldo_base para persistir entre meses
+                    saldo_atual = saldo_conta(user_id, conta_id_ajuste)
+                    if abs(saldo_atual - novo_saldo_desejado) < 0.01:
+                        bot.reply_to(message, f"O saldo{sufixo_conta} já está em R$ {novo_saldo_desejado:.2f}, nada pra ajustar.")
+                    else:
+                        definir_saldo_base_conta(user_id, conta_id_ajuste, novo_saldo_desejado)
+                        bot.reply_to(
+                            message,
+                            f"✅ Saldo{sufixo_conta} definido para *R$ {novo_saldo_desejado:.2f}*.\n"
+                            f"_Esse valor vai persistir entre os meses — é o saldo real da conta._",
+                            parse_mode="Markdown",
+                        )
                 else:
+                    # Sem conta: ajuste no pool geral do mês (comportamento original)
                     saldo_atual = total_receita_mes(user_id) - total_gasto_mes(user_id)
-                diferenca = novo_saldo_desejado - saldo_atual
-                if diferenca > 0:
-                    salvar_receita(user_id, diferenca, "Ajuste de Saldo", "Ajuste manual do sistema", conta_id=conta_id_ajuste)
-                    bot.reply_to(message, f"⚖️ Lancei uma entrada de R$ {diferenca:.2f}{sufixo_conta} pra fechar o saldo em R$ {novo_saldo_desejado:.2f}.")
-                elif diferenca < 0:
-                    salvar_gasto(user_id, abs(diferenca), "Ajuste de Saldo", "Ajuste manual do sistema",
-                                 metodo_pagamento="Outros", conta_id=conta_id_ajuste)
-                    bot.reply_to(message, f"⚖️ Lancei uma saída de R$ {abs(diferenca):.2f}{sufixo_conta} pra fechar o saldo em R$ {novo_saldo_desejado:.2f}.")
-                else:
-                    bot.reply_to(message, f"O seu saldo{sufixo_conta} já está exatamente em R$ {novo_saldo_desejado:.2f}, não precisa ajustar.")
+                    diferenca = novo_saldo_desejado - saldo_atual
+                    if diferenca > 0:
+                        salvar_receita(user_id, diferenca, "Ajuste de Saldo", "Ajuste manual do sistema")
+                        bot.reply_to(message, f"⚖️ Lancei uma entrada de R$ {diferenca:.2f} pra fechar o saldo em R$ {novo_saldo_desejado:.2f}.")
+                    elif diferenca < 0:
+                        salvar_gasto(user_id, abs(diferenca), "Ajuste de Saldo", "Ajuste manual do sistema", metodo_pagamento="Outros")
+                        bot.reply_to(message, f"⚖️ Lancei uma saída de R$ {abs(diferenca):.2f} pra fechar o saldo em R$ {novo_saldo_desejado:.2f}.")
+                    else:
+                        bot.reply_to(message, f"O seu saldo já está exatamente em R$ {novo_saldo_desejado:.2f}, não precisa ajustar.")
 
         elif intencao == "definir_orcamento":
             valor = parse_valor(dados.get("valor"))
@@ -4758,7 +4853,7 @@ def processar_mensagem(message):
             bot.reply_to(message, f"🗑️ Gasto fixo #{fid} removido." if n else f"Não encontrei o gasto fixo #{fid}.")
 
         elif intencao == "consultar_relatorio":
-            gerar_relatorio(message)
+            gerar_relatorio(message, completo=bool(dados.get("relatorio_completo", False)))
 
         elif intencao == "comparar_meses":
             bot.reply_to(message, comparar_meses_texto(user_id), parse_mode="Markdown")
@@ -5236,10 +5331,8 @@ def processar_mensagem(message):
                 detalhes = tipo or "Conta"
                 if banco and banco.lower() != nome.lower():
                     detalhes += f" · {banco}"
-                texto += f"\n• #{cid} *{escape_md(nome)}* ({detalhes})\n  Saldo do mês: R$ {saldo:.2f}"
-            saldo_geral_sem_conta = saldo_conta(user_id, None) - sum(
-                saldo_conta(user_id, c[0]) for c in contas
-            )
+                texto += f"\n• #{cid} *{escape_md(nome)}* ({detalhes})\n  Saldo atual: R$ {saldo:.2f}"
+            saldo_geral_sem_conta = saldo_conta(user_id, None)
             texto += f"\n\n_Geral (sem conta específica): R$ {saldo_geral_sem_conta:.2f}_"
             bot.reply_to(message, texto, parse_mode="Markdown")
 
@@ -5339,19 +5432,29 @@ def processar_mensagem(message):
                 if cid is False:
                     return
                 if cid is None:
-                    saldo_g = total_receita_mes(user_id) - total_gasto_mes(user_id)
-                    bot.reply_to(message, f"💰 Saldo geral do mês: R$ {saldo_g:.2f}")
+                    rec = total_receita_mes(user_id)
+                    gas = total_gasto_mes(user_id)
+                    bot.reply_to(
+                        message,
+                        f"💰 *Saldo geral — {fmt_mes(mes_atual())}*\n"
+                        f"➕ Entradas: R$ {rec:.2f}\n"
+                        f"➖ Saídas: R$ {gas:.2f}\n"
+                        f"💵 Saldo do mês: R$ {rec - gas:.2f}",
+                        parse_mode="Markdown",
+                    )
                     return
                 obj = buscar_conta(user_id, conta_id=cid)
-                rec = total_receita_mes(user_id, conta_id=cid)
-                gas = total_gasto_mes(user_id, conta_id=cid)
-                saldo = rec - gas
+                saldo_atual = saldo_conta(user_id, cid)
+                rec_mes = total_receita_mes(user_id, conta_id=cid)
+                gas_mes = total_gasto_mes(user_id, conta_id=cid)
                 bot.reply_to(
                     message,
-                    f"🏦 *{escape_md(obj[1])}* — saldo do mês\n"
-                    f"➕ Entradas: R$ {rec:.2f}\n"
-                    f"➖ Saídas: R$ {gas:.2f}\n"
-                    f"💰 Saldo: R$ {saldo:.2f}",
+                    f"🏦 *{escape_md(obj[1])}*\n"
+                    f"💰 Saldo atual: *R$ {saldo_atual:.2f}*\n"
+                    f"━━━━━━━━━━━━━━━━━\n"
+                    f"📅 Este mês ({fmt_mes(mes_atual())}):\n"
+                    f"  ➕ Entradas: R$ {rec_mes:.2f}\n"
+                    f"  ➖ Saídas: R$ {gas_mes:.2f}",
                     parse_mode="Markdown",
                 )
             else:
@@ -5363,17 +5466,14 @@ def processar_mensagem(message):
                     f"➕ Entradas: R$ {rec_geral:.2f}\n"
                     f"➖ Saídas: R$ {gas_geral:.2f}\n"
                     f"━━━━━━━━━━━━━━━━━\n"
-                    f"💵 Saldo total: R$ {rec_geral - gas_geral:.2f}"
+                    f"💵 Saldo do mês: R$ {rec_geral - gas_geral:.2f}"
                 )
                 if contas:
-                    texto += "\n\n*Por conta:*"
-                    soma_contas = 0.0
+                    texto += "\n\n*Saldo atual das contas:*"
                     for cid, nome_c, _b, _t, _c in contas:
                         s = saldo_conta(user_id, cid)
-                        soma_contas += s
                         texto += f"\n• {escape_md(nome_c)}: R$ {s:.2f}"
-                    geral_sem_conta = (rec_geral - gas_geral) - soma_contas
-                    texto += f"\n• _Geral (sem conta): R$ {geral_sem_conta:.2f}_"
+                    texto += f"\n• _Geral (sem conta): R$ {saldo_conta(user_id, None):.2f}_"
                 bot.reply_to(message, texto, parse_mode="Markdown")
 
         else:
